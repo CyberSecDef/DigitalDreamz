@@ -16,6 +16,7 @@ def run_session(config: dict):
     samp_cfg = config["sampling"]
     inj_cfg = config["injection"]
     log_cfg = config["logging"]
+    mon_cfg = config.get("monitor", {})
 
     perspective = sess_cfg["perspective"]
     duration = sess_cfg["duration_minutes"] * 60
@@ -24,6 +25,14 @@ def run_session(config: dict):
     injection_mode = inj_cfg.get("mode", "visible")
     window_by_phase = samp_cfg.get("context_window_by_phase", {})
     default_window = samp_cfg["context_window_tokens"]
+    rem_peak = samp_cfg.get("rem_peak_fraction", 0.75)
+
+    topical_patterns = sampler.load_topical_patterns(
+        mon_cfg.get("topical_blocklist_path", "")
+    )
+    stickiness_enabled = bool(mon_cfg.get("stickiness_enabled", False))
+    stickiness_threshold = float(mon_cfg.get("stickiness_threshold", 0.5))
+    stickiness_patience = int(mon_cfg.get("stickiness_patience", 3))
 
     db = db_mod.DB(log_cfg["db_path"])
     renderer = ui.DreamRenderer()
@@ -35,7 +44,7 @@ def run_session(config: dict):
     )
 
     base_sys_prompt = prompts.system_prompt(perspective)
-    seed = prompts.initial_seed(perspective, index=int(time.time()) % 3)
+    seed = prompts.random_seed(perspective)
 
     session_id = db.start_session(
         model=f"{model_cfg['provider']}/{model_cfg['name']}",
@@ -49,6 +58,7 @@ def run_session(config: dict):
     step = 0
     last_injection_step = -inj_cfg["base_interval_steps"]
     pending_deferred: list[tuple[str, str]] = []  # (source, fragment) waiting one step
+    consecutive_sticky = 0
     start = time.time()
 
     try:
@@ -58,7 +68,11 @@ def run_session(config: dict):
             phase = sampler.phase_for(pos)
             window_tokens = sampler.window_for_phase(phase, window_by_phase, default_window)
             temp = sampler.temperature_for(
-                pos, samp_cfg["base_temp"], samp_cfg["temp_min"], samp_cfg["temp_max"]
+                pos,
+                samp_cfg["base_temp"],
+                samp_cfg["temp_min"],
+                samp_cfg["temp_max"],
+                rem_peak_fraction=rem_peak,
             )
 
             # phase transition logging + (optional) self-state refresh
@@ -136,11 +150,17 @@ def run_session(config: dict):
                 renderer.console.print(f"\n[red]API error: {e}[/red]")
                 time.sleep(2)
 
-            # register-drift check on the freshly extended buffer
+            # contamination checks on the freshly extended buffer
             full_text = "".join(buffer)
-            drift = sampler.detect_register_drift(full_text)
-            if drift is not None:
-                pattern, snippet = drift
+            handled = False
+
+            for kind, hit in (
+                ("register", sampler.detect_register_drift(full_text)),
+                ("topical",  sampler.detect_topical_drift(full_text, topical_patterns)),
+            ):
+                if hit is None:
+                    continue
+                pattern, snippet = hit
                 truncated, removed = sampler.truncate_to_clean_sentence(full_text)
                 if removed > 0:
                     buffer = [truncated]
@@ -152,17 +172,49 @@ def run_session(config: dict):
                         )
                     db.log_contamination(
                         session_id, step, phase, pattern, snippet,
-                        action="recovered",
+                        action="recovered", kind=kind,
                         truncated_chars=removed,
                         recovery_fragment=recovery or None,
                     )
-                    renderer.render_contamination(pattern, "recovered")
+                    renderer.render_contamination(f"{kind}: {pattern}", "recovered")
                 else:
                     db.log_contamination(
                         session_id, step, phase, pattern, snippet,
-                        action="logged",
+                        action="logged", kind=kind,
                     )
-                    renderer.render_contamination(pattern, "logged")
+                    renderer.render_contamination(f"{kind}: {pattern}", "logged")
+                handled = True
+                consecutive_sticky = 0
+                break  # one recovery per step is plenty
+
+            # register-stickiness — softer signal, fires only when patience
+            # exhausted and only triggers a perturbation injection (no truncation).
+            if not handled and stickiness_enabled:
+                score = sampler.register_stickiness(full_text)
+                if score >= stickiness_threshold:
+                    consecutive_sticky += 1
+                else:
+                    consecutive_sticky = 0
+                if consecutive_sticky >= stickiness_patience:
+                    perturb = corpus.sample_latent() or ""
+                    if perturb:
+                        buffer.append(f"\n\n[{perturb}]\n\n")
+                        db.log_injection(
+                            session_id, step, phase, "latent", "stickiness", perturb
+                        )
+                    db.log_contamination(
+                        session_id, step, phase,
+                        pattern=f"stickiness={score:.2f}",
+                        snippet=full_text[-300:],
+                        action="recovered" if perturb else "logged",
+                        kind="stickiness",
+                        recovery_fragment=perturb or None,
+                    )
+                    renderer.render_contamination(
+                        f"stickiness={score:.2f}",
+                        "recovered" if perturb else "logged",
+                    )
+                    consecutive_sticky = 0
 
             step += 1
 

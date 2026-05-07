@@ -1,0 +1,38 @@
+# Topical-drift blocklist — catches commentary-blog / culture-war basins
+# the base model can fall into. Single words are matched whole-word
+# case-insensitively; multi-word entries are matched as case-insensitive
+# substrings. Lines starting with # and blank lines are ignored.
+#
+# Tune freely — these are the spec's starter set, not a fixed rule.
+
+# Political / ideological
+vaccine
+vaccination
+vaxx
+denier
+deniers
+woke
+wokeness
+cancel culture
+cancelled
+mainstream media
+MSM
+
+# Identity / culture-war framing
+transgenderism
+trans agenda
+pronouns
+gender ideology
+radical
+
+# Conspiracy-adjacent
+globalist
+elites
+agenda
+they don't want you to know
+wake up
+
+# Health / diet flashpoints
+vegan agenda
+big pharma
+natural immunity

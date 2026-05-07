@@ -74,6 +74,7 @@ def load_config(root: str | Path = ".") -> dict:
             "max_tokens_per_step": int(g("SAMPLING_MAX_TOKENS_PER_STEP")),
             "context_window_tokens": default_window,
             "context_window_by_phase": window_by_phase,
+            "rem_peak_fraction": float(os.environ.get("SAMPLING_REM_PEAK_FRACTION", "0.75")),
         },
         "injection": {
             "base_interval_steps": int(g("INJECTION_BASE_INTERVAL_STEPS")),
@@ -95,11 +96,22 @@ def load_config(root: str | Path = ".") -> dict:
                 "blocklist_path": os.environ.get(
                     "WORLD_BLOCKLIST_PATH", "./data/world_blocklist.txt"
                 ),
+                "sanitize_fragments": _bool(
+                    os.environ.get("WORLD_SANITIZE_FRAGMENTS", "true")
+                ),
             },
             "latent": {
                 "path": g("CORPUS_LATENT_PATH"),
                 "chunk_chars": int(g("CORPUS_LATENT_CHUNK_CHARS")),
             },
+        },
+        "monitor": {
+            "topical_blocklist_path": os.environ.get(
+                "TOPICAL_BLOCKLIST_PATH", "./data/topical_blocklist.txt"
+            ),
+            "stickiness_enabled": _bool(os.environ.get("STICKINESS_ENABLED", "false")),
+            "stickiness_threshold": float(os.environ.get("STICKINESS_THRESHOLD", "0.5")),
+            "stickiness_patience": int(os.environ.get("STICKINESS_PATIENCE", "3")),
         },
         "self_state": {
             "enabled": _bool(os.environ.get("SELF_STATE_ENABLED", "false")),

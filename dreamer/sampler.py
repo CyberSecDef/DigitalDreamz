@@ -7,6 +7,7 @@ Within each cycle, position runs 0.0 → 1.0; phases and temperatures derive fro
 import math
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 
@@ -30,13 +31,20 @@ def phase_for(pos: float) -> str:
     return "surface"
 
 
-def temperature_for(pos: float, base: float, tmin: float, tmax: float) -> float:
+def temperature_for(
+    pos: float,
+    base: float,
+    tmin: float,
+    tmax: float,
+    rem_peak_fraction: float = 0.75,
+) -> float:
     """Piecewise sleep-cycle temperature curve.
 
     drift   (0.00–0.10): tmin → base, linear  (settling in)
     light   (0.10–0.30): base, with small jitter
     deep    (0.30–0.45): base → tmax, ramp    (max weirdness)
-    rem     (0.45–0.85): high plateau ~0.7*tmax with oscillation (vivid)
+    rem     (0.45–0.85): plateau at base + rem_peak_fraction*(tmax-base),
+                         with oscillation. 0.75 is the legacy value.
     surface (0.85–1.00): tmax → base, ramp down (waking)
     """
     if pos < 0.10:
@@ -46,7 +54,7 @@ def temperature_for(pos: float, base: float, tmin: float, tmax: float) -> float:
     if pos < 0.45:
         return _lerp(base, tmax, (pos - 0.30) / 0.15)
     if pos < 0.85:
-        plateau = base + (tmax - base) * 0.75
+        plateau = base + (tmax - base) * rem_peak_fraction
         return plateau + 0.12 * math.sin(pos * 35)
     return _lerp(tmax, base, (pos - 0.85) / 0.15)
 
@@ -201,3 +209,93 @@ def truncate_to_clean_sentence(text: str, max_lookback: int = 500) -> tuple[str,
 
     # No clean boundary found — hard cut at lookback edge.
     return text[:start], len(text) - start
+
+
+# ---------- topical-drift (commentary-blog / culture-war basins) ----------
+
+# Module-level cache so we only read each blocklist file once.
+_topical_cache: dict[str, list[str]] = {}
+
+
+def load_topical_patterns(path: str) -> list[str]:
+    """Load patterns from a blocklist file, one pattern per line. Comment
+    lines (starting with #) and blank lines are skipped. Patterns are kept
+    in their original case but matched case-insensitively at scan time.
+
+    Multi-word patterns are matched as substrings; single tokens use
+    word-boundary matching.
+    """
+    if path in _topical_cache:
+        return _topical_cache[path]
+    p = Path(path) if not isinstance(path, Path) else path
+    patterns: list[str] = []
+    if p.exists():
+        for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            patterns.append(s)
+    _topical_cache[path] = patterns
+    return patterns
+
+
+def detect_topical_drift(
+    text: str, patterns: list[str], window_chars: int = 300
+) -> Optional[tuple[str, str]]:
+    """Scan the tail of `text` for any topical-blocklist pattern.
+
+    Returns (matched_pattern, snippet) on the first hit, or None.
+    Bracketed injection fragments are stripped before scanning, same as
+    the register detector.
+    """
+    if not patterns:
+        return None
+    tail = text[-window_chars:] if len(text) > window_chars else text
+    if not tail:
+        return None
+    scrubbed = _BRACKETED.sub(" ", tail)
+    if not scrubbed.strip():
+        return None
+    lower = scrubbed.lower()
+    for pat in patterns:
+        pat_lower = pat.lower()
+        if " " in pat:
+            if pat_lower in lower:
+                return pat, tail
+        else:
+            if re.search(rf"\b{re.escape(pat_lower)}\b", lower):
+                return pat, tail
+    return None
+
+
+# ---------- register-stickiness (lightweight n-gram similarity) ----------
+
+def _char_ngrams(text: str, n: int = 5) -> set[str]:
+    text = text.lower()
+    if len(text) < n:
+        return set()
+    return {text[i : i + n] for i in range(len(text) - n + 1)}
+
+
+def register_stickiness(text: str, half_chars: int = 500) -> float:
+    """Cosine-flavored Jaccard similarity between two adjacent halves of the
+    tail. High score → the model has been generating in the same register
+    for a long time even though surface tokens differ. 0.0 → totally
+    different distribution; ~1.0 → indistinguishable.
+
+    Returns 0.0 when there's not enough text to score.
+    """
+    if len(text) < half_chars * 2:
+        return 0.0
+    a = text[-half_chars * 2 : -half_chars]
+    b = text[-half_chars:]
+    # Strip bracketed injections so we score only model-produced text.
+    a_clean = _BRACKETED.sub(" ", a)
+    b_clean = _BRACKETED.sub(" ", b)
+    sa = _char_ngrams(a_clean)
+    sb = _char_ngrams(b_clean)
+    if not sa or not sb:
+        return 0.0
+    inter = len(sa & sb)
+    union = len(sa | sb)
+    return inter / union if union else 0.0

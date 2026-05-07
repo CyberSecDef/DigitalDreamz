@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS contamination_events (
     step INTEGER NOT NULL,
     ts REAL NOT NULL,
     phase TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'register',   -- 'register' | 'topical' | 'stickiness'
     pattern TEXT NOT NULL,
     snippet TEXT NOT NULL,
     action TEXT NOT NULL,             -- 'logged' | 'recovered'
@@ -87,6 +88,7 @@ CREATE INDEX IF NOT EXISTS idx_self_states_session ON self_states(session_id);
 # exists, which we swallow.
 _MIGRATIONS = [
     "ALTER TABLE phase_transitions ADD COLUMN window_tokens INTEGER",
+    "ALTER TABLE contamination_events ADD COLUMN kind TEXT NOT NULL DEFAULT 'register'",
 ]
 
 
@@ -140,16 +142,18 @@ class DB:
         pattern,
         snippet,
         action,
+        kind="register",
         truncated_chars=None,
         recovery_fragment=None,
     ):
         self.conn.execute(
-            "INSERT INTO contamination_events (session_id, step, ts, phase, pattern, snippet, action, truncated_chars, recovery_fragment) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO contamination_events (session_id, step, ts, phase, kind, pattern, snippet, action, truncated_chars, recovery_fragment) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 session_id,
                 step,
                 time.time(),
                 phase,
+                kind,
                 pattern,
                 snippet,
                 action,

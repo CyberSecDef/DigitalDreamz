@@ -78,6 +78,34 @@ def _load_blocklist(path: str) -> set[str]:
     return tokens
 
 
+# Strip URLs and metadata-label scaffolding that gives the model a strong
+# news-article / HN-post genre signal.
+_URL_RE = re.compile(r"https?://\S+")
+_METADATA_LABEL_RE = re.compile(
+    r"\b(?:Article URL|Comments URL|Comments|# Comments|Points?|Posted by|"
+    r"Source|Read more|Continue reading)\s*[:\-]\s*",
+    re.IGNORECASE,
+)
+# Common dateline/wire patterns: "BEIJING:", "REUTERS —", "NEW YORK (AP)",
+# "(Reuters) —". The third alt catches a CITY followed by a parenthesized
+# wire-service tag without a separator.
+_DATELINE_RE = re.compile(
+    r"^\s*(?:[A-Z][A-Z]+(?:\s+[A-Z][A-Z]+)*\s*[:—–\-])"
+    r"|^\s*\(?(?:Reuters|AP|AFP|Bloomberg|Press Association|PA)\)?\s*[:—–\-]?"
+    r"|^\s*[A-Z][A-Z]+(?:\s+[A-Z][A-Z]+)*\s*\([A-Za-z]+\)\s*",
+    re.MULTILINE,
+)
+
+
+def _sanitize_world_fragment(text: str) -> str:
+    text = _URL_RE.sub("", text)
+    text = _METADATA_LABEL_RE.sub("", text)
+    text = _DATELINE_RE.sub("", text)
+    # Collapse repeated whitespace introduced by the substitutions.
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 class WorldEvents:
     REFRESH_SECONDS = 1800  # 30 min
 
@@ -86,10 +114,12 @@ class WorldEvents:
         feeds: list[str],
         blocklist: Optional[set[str]] = None,
         filter_enabled: bool = False,
+        sanitize: bool = True,
     ):
         self.feeds = feeds
         self.blocklist = blocklist or set()
         self.filter_enabled = filter_enabled
+        self.sanitize = sanitize
         self.fragments: list[str] = []
         self._last_fetch = 0.0
         self._word_re = re.compile(r"[A-Za-z']+")
@@ -101,6 +131,9 @@ class WorldEvents:
         words = (w.lower() for w in self._word_re.findall(text))
         return any(w in self.blocklist for w in words)
 
+    def _maybe_sanitize(self, text: str) -> str:
+        return _sanitize_world_fragment(text) if self.sanitize else text
+
     def _refresh(self):
         now = time.time()
         if now - self._last_fetch < self.REFRESH_SECONDS and self.fragments:
@@ -110,8 +143,12 @@ class WorldEvents:
             try:
                 d = feedparser.parse(url)
                 for entry in d.entries[:25]:
-                    title = (entry.get("title") or "").strip()
-                    summary = re.sub(r"<[^>]+>", "", entry.get("summary", "")).strip()
+                    title = self._maybe_sanitize(
+                        (entry.get("title") or "").strip()
+                    )
+                    summary = self._maybe_sanitize(
+                        re.sub(r"<[^>]+>", "", entry.get("summary", "")).strip()
+                    )
                     if title and not self._is_blocked(title):
                         new_frags.append(title)
                     if summary and 30 < len(summary) < 280:
@@ -134,26 +171,90 @@ class WorldEvents:
 # ---------- LATENT SUBSTRATE ----------
 
 class LatentCorpus:
+    """Loads .txt/.md files from the latent path. Files are weighted, with
+    per-file or per-subdirectory overrides read from `weights.txt` files
+    placed alongside the content.
+
+    `weights.txt` format (one entry per line):
+        <pattern> <weight>
+    Pattern is matched against `Path.relative_to(latent_root)` as a
+    fnmatch-style glob (e.g. `essays/*`, `poetry/*.txt`, `red_book.md`).
+    Patterns are evaluated in order; the first match wins. Files that match
+    no pattern get weight 1.0. A weight of 0 excludes the file from sampling
+    without removing it from disk.
+    """
+
     def __init__(self, path: str, chunk_chars: int = 280):
         self.path = Path(path)
         self.chunk_chars = chunk_chars
         self.texts: list[str] = []
+        self.weights: list[float] = []
         self._load()
 
     def _load(self):
         if not self.path.exists():
             return
+        weight_rules = self._collect_weight_rules()
         for f in self.path.glob("**/*"):
-            if f.is_file() and f.suffix.lower() in {".txt", ".md"}:
+            if f.is_file() and f.suffix.lower() in {".txt", ".md"} and f.name != "weights.txt":
                 try:
-                    self.texts.append(f.read_text(encoding="utf-8", errors="ignore"))
+                    content = f.read_text(encoding="utf-8", errors="ignore")
                 except Exception:
-                    pass
+                    continue
+                rel = f.relative_to(self.path).as_posix()
+                w = self._weight_for(rel, weight_rules)
+                if w <= 0:
+                    continue
+                self.texts.append(content)
+                self.weights.append(w)
+
+    def _collect_weight_rules(self) -> list[tuple[str, float]]:
+        """Read every weights.txt file under the latent path. Rules from
+        deeper files override shallower ones for matches under that subtree."""
+        import fnmatch  # noqa: F401  (used implicitly via _weight_for)
+        rules: list[tuple[str, float]] = []
+        for wf in sorted(self.path.glob("**/weights.txt")):
+            base = wf.parent.relative_to(self.path).as_posix()
+            if base == ".":
+                base = ""
+            try:
+                lines = wf.read_text(encoding="utf-8", errors="ignore").splitlines()
+            except Exception:
+                continue
+            for line in lines:
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                # Strip inline comments (anything from a #-preceded-by-
+                # whitespace token onward).
+                hash_pos = s.find(" #")
+                if hash_pos >= 0:
+                    s = s[:hash_pos].rstrip()
+                if not s:
+                    continue
+                parts = s.rsplit(None, 1)
+                if len(parts) != 2:
+                    continue
+                pattern, raw = parts
+                try:
+                    weight = float(raw)
+                except ValueError:
+                    continue
+                full_pattern = f"{base}/{pattern}" if base else pattern
+                rules.append((full_pattern, weight))
+        return rules
+
+    def _weight_for(self, rel_path: str, rules: list[tuple[str, float]]) -> float:
+        import fnmatch
+        for pattern, weight in rules:
+            if fnmatch.fnmatchcase(rel_path, pattern):
+                return weight
+        return 1.0
 
     def sample(self) -> Optional[str]:
         if not self.texts:
             return None
-        text = random.choice(self.texts)
+        text = random.choices(self.texts, weights=self.weights, k=1)[0]
         if len(text) <= self.chunk_chars:
             return text.strip()
         start = random.randint(0, len(text) - self.chunk_chars)
@@ -181,7 +282,10 @@ class Corpus:
         filter_enabled = bool(we.get("refusal_filter_enabled", False)) and is_instruct
         blocklist = _load_blocklist(we.get("blocklist_path", "")) if filter_enabled else set()
         self.world = WorldEvents(
-            we["feeds"], blocklist=blocklist, filter_enabled=filter_enabled
+            we["feeds"],
+            blocklist=blocklist,
+            filter_enabled=filter_enabled,
+            sanitize=bool(we.get("sanitize_fragments", True)),
         )
 
         self.latent = LatentCorpus(
