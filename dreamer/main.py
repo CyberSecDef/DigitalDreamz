@@ -1,10 +1,11 @@
 """Main dream loop: self-prompting, oscillating, injecting, logging."""
+import os
 import time
 import random
-import yaml
 import click
 
 from . import prompts, llm, sampler, ui, db as db_mod
+from .config import load_config
 from .corpus import Corpus
 
 
@@ -127,12 +128,13 @@ def _trim_buffer(buffer: list[str], approx_token_budget: int) -> str:
 
 
 @click.command()
-@click.option("--config", "config_path", default="config.yaml", help="Path to config.yaml")
+@click.option("--env", "environment", default=None, help="Environment: dev | prod (sets ENVIRONMENT)")
 @click.option("--perspective", default=None, help="Override perspective: third | none")
 @click.option("--duration", default=None, type=int, help="Override duration in minutes")
-def main(config_path: str, perspective: str, duration: int):
-    with open(config_path) as f:
-        config = yaml.safe_load(f)
+def main(environment: str, perspective: str, duration: int):
+    if environment:
+        os.environ["ENVIRONMENT"] = environment
+    config = load_config()
     if perspective:
         config["session"]["perspective"] = perspective
     if duration:
