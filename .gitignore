@@ -1,0 +1,55 @@
+# Byte-compiled / cached
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+
+# Environment files — keep .env.example if you add one
+.env
+.env.*
+!.env.example
+
+# App data
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+dreams*.db
+corpus/today/*
+!corpus/today/.gitkeep
+corpus/latent/*
+!corpus/latent/.gitkeep
+
+# Logs
+*.log
+logs/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
