@@ -33,6 +33,11 @@ def _bool(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _opt_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    return int(raw) if raw not in (None, "") else default
+
+
 def load_config(root: str | Path = ".") -> dict:
     root = Path(root)
     load_dotenv(root / ".env", override=False)
@@ -42,6 +47,12 @@ def load_config(root: str | Path = ".") -> dict:
         load_dotenv(overlay, override=True)
 
     g = os.environ.__getitem__  # raise KeyError for required vars
+
+    default_window = int(g("SAMPLING_CONTEXT_WINDOW_TOKENS"))
+    window_by_phase = {
+        phase: _opt_int(f"SAMPLING_CONTEXT_WINDOW_{phase.upper()}", default_window)
+        for phase in PHASES
+    }
 
     return {
         "environment": env_name,
@@ -53,6 +64,7 @@ def load_config(root: str | Path = ".") -> dict:
         "model": {
             "provider": g("MODEL_PROVIDER"),
             "name": g("MODEL_NAME"),
+            "mode": os.environ.get("MODEL_MODE", "instruct").strip().lower(),
         },
         "sampling": {
             "base_temp": float(g("SAMPLING_BASE_TEMP")),
@@ -60,12 +72,14 @@ def load_config(root: str | Path = ".") -> dict:
             "temp_max": float(g("SAMPLING_TEMP_MAX")),
             "top_p": float(g("SAMPLING_TOP_P")),
             "max_tokens_per_step": int(g("SAMPLING_MAX_TOKENS_PER_STEP")),
-            "context_window_tokens": int(g("SAMPLING_CONTEXT_WINDOW_TOKENS")),
+            "context_window_tokens": default_window,
+            "context_window_by_phase": window_by_phase,
         },
         "injection": {
             "base_interval_steps": int(g("INJECTION_BASE_INTERVAL_STEPS")),
             "stall_threshold": float(g("INJECTION_STALL_THRESHOLD")),
             "jitter": float(g("INJECTION_JITTER")),
+            "mode": os.environ.get("INJECTION_MODE", "visible").strip().lower(),
             "weights": {
                 phase: _weight_triple(g(f"INJECTION_WEIGHTS_{phase.upper()}"))
                 for phase in PHASES
@@ -73,11 +87,22 @@ def load_config(root: str | Path = ".") -> dict:
         },
         "corpus": {
             "day_residue": {"path": g("CORPUS_DAY_RESIDUE_PATH")},
-            "world_events": {"feeds": _split_csv(g("CORPUS_WORLD_FEEDS"))},
+            "world_events": {
+                "feeds": _split_csv(g("CORPUS_WORLD_FEEDS")),
+                "refusal_filter_enabled": _bool(
+                    os.environ.get("WORLD_REFUSAL_FILTER_ENABLED", "true")
+                ),
+                "blocklist_path": os.environ.get(
+                    "WORLD_BLOCKLIST_PATH", "./data/world_blocklist.txt"
+                ),
+            },
             "latent": {
                 "path": g("CORPUS_LATENT_PATH"),
                 "chunk_chars": int(g("CORPUS_LATENT_CHUNK_CHARS")),
             },
+        },
+        "self_state": {
+            "enabled": _bool(os.environ.get("SELF_STATE_ENABLED", "false")),
         },
         "logging": {
             "db_path": g("LOG_DB_PATH"),

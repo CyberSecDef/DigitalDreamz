@@ -1,0 +1,41 @@
+# Token blocklist for the world-events RSS corpus.
+# Any RSS title/summary containing a whole-word match (case-insensitive)
+# against any entry below is dropped before injection.
+# One token per line. Lines starting with # and blank lines are ignored.
+arrest
+arrests
+arrested
+attack
+attacks
+attacked
+victim
+victims
+weapon
+weapons
+kill
+kills
+killed
+killing
+killings
+murder
+murders
+murdered
+assault
+assaults
+assaulted
+illegal
+bomb
+bombs
+bombed
+bombing
+shoot
+shoots
+shooting
+shootings
+shot
+rape
+rapes
+raped
+abuse
+abuses
+abused

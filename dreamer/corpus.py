@@ -65,14 +65,41 @@ class DayResidue:
 
 # ---------- WORLD EVENTS ----------
 
+def _load_blocklist(path: str) -> set[str]:
+    p = Path(path)
+    if not p.exists():
+        return set()
+    tokens: set[str] = set()
+    for line in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        tokens.add(line.lower())
+    return tokens
+
+
 class WorldEvents:
     REFRESH_SECONDS = 1800  # 30 min
 
-    def __init__(self, feeds: list[str]):
+    def __init__(
+        self,
+        feeds: list[str],
+        blocklist: Optional[set[str]] = None,
+        filter_enabled: bool = False,
+    ):
         self.feeds = feeds
+        self.blocklist = blocklist or set()
+        self.filter_enabled = filter_enabled
         self.fragments: list[str] = []
         self._last_fetch = 0.0
+        self._word_re = re.compile(r"[A-Za-z']+")
         self._refresh()
+
+    def _is_blocked(self, text: str) -> bool:
+        if not self.filter_enabled or not self.blocklist:
+            return False
+        words = (w.lower() for w in self._word_re.findall(text))
+        return any(w in self.blocklist for w in words)
 
     def _refresh(self):
         now = time.time()
@@ -85,12 +112,12 @@ class WorldEvents:
                 for entry in d.entries[:25]:
                     title = (entry.get("title") or "").strip()
                     summary = re.sub(r"<[^>]+>", "", entry.get("summary", "")).strip()
-                    if title:
+                    if title and not self._is_blocked(title):
                         new_frags.append(title)
                     if summary and 30 < len(summary) < 280:
-                        # take first sentence-ish
                         first = re.split(r"(?<=[.!?])\s", summary)[0]
-                        new_frags.append(first)
+                        if not self._is_blocked(first):
+                            new_frags.append(first)
             except Exception:
                 continue
         if new_frags:
@@ -146,11 +173,25 @@ class Corpus:
     def __init__(self, config: dict):
         c = config["corpus"]
         self.day = DayResidue(c["day_residue"]["path"])
-        self.world = WorldEvents(c["world_events"]["feeds"])
+
+        # Refusal filter is auto-disabled in base mode (no chat-tuned refusals
+        # to dodge), regardless of the env-flag value.
+        we = c["world_events"]
+        is_instruct = config.get("model", {}).get("mode", "instruct") == "instruct"
+        filter_enabled = bool(we.get("refusal_filter_enabled", False)) and is_instruct
+        blocklist = _load_blocklist(we.get("blocklist_path", "")) if filter_enabled else set()
+        self.world = WorldEvents(
+            we["feeds"], blocklist=blocklist, filter_enabled=filter_enabled
+        )
+
         self.latent = LatentCorpus(
             c["latent"]["path"], c["latent"].get("chunk_chars", 280)
         )
         self.weights = config["injection"]["weights"]
+
+    def sample_latent(self) -> Optional[str]:
+        """Used by recovery surgery — high-dissociation source."""
+        return self.latent.sample()
 
     def sample_for_phase(self, phase: str) -> tuple[str, str]:
         """Returns (source_name, fragment). May return ('', '') if all empty."""

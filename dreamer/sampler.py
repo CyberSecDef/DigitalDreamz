@@ -1,10 +1,13 @@
-"""Sleep-cycle modeling: phase detection + temperature oscillation.
+"""Sleep-cycle modeling: phase detection + temperature oscillation,
+plus stall + register-drift detection and clean-truncation helper.
 
 A "cycle" is one drift→light→deep→rem→surface arc, ~15 min in config.
 Within each cycle, position runs 0.0 → 1.0; phases and temperatures derive from it.
 """
 import math
+import re
 from dataclasses import dataclass
+from typing import Optional
 
 
 PHASE_BOUNDARIES = [
@@ -88,3 +91,113 @@ class PhaseState:
         prev = self.current
         self.current = new
         return prev, changed
+
+
+# ---------- phase-conditional context window ----------
+
+_DEFAULT_WINDOW_BY_PHASE = {
+    "drift": 800,
+    "light": 1000,
+    "deep": 1400,
+    "rem": 600,
+    "surface": 1000,
+}
+
+
+def window_for_phase(phase: str, by_phase: Optional[dict] = None, default: int = 1000) -> int:
+    """Return the prompt-window token budget for a given phase.
+
+    Falls back to the default if a phase isn't in the mapping.
+    """
+    table = by_phase if by_phase is not None else _DEFAULT_WINDOW_BY_PHASE
+    return int(table.get(phase, default))
+
+
+# ---------- register-drift (assistant/chat-mode contamination) ----------
+
+# Phrases that signal the dream-state has collapsed back into a chat-assistant
+# register. These are matched case-insensitively as substrings.
+_DRIFT_PHRASES = (
+    "I see what you",
+    "Let me",
+    "I can't provide",
+    "I cannot provide",
+    "I'll attempt",
+    "I'll continue",
+    "Here's a",
+    "Here is a",
+    "Let's",
+    "I notice",
+    "generative substrate",  # the model parroting its own system prompt
+)
+
+# Tighter second-person regex: only contractions and possessive (the spec's
+# explicit list). Bare "you" appears too often in non-assistant prose to be
+# useful as a trigger.
+_DRIFT_REGEXES = [
+    (re.compile(r"\byou(?:'ve|'re|'ll|'d|r|rself)\b", re.IGNORECASE), "second-person"),
+    (re.compile(r"\*\*[^*\n]+\*\*"), "markdown-bold"),
+    (re.compile(r"^\s*\d+\.\s+", re.MULTILINE), "numbered-list"),
+    (re.compile(r"^\s*#{1,6}\s+\S", re.MULTILINE), "markdown-heading"),
+]
+
+# Bracketed injections are explicitly "residue surfacing" per the system
+# prompt — patterns inside them are not the model's register. Strip them
+# from text before drift detection.
+_BRACKETED = re.compile(r"\[[^\[\]]*\]", re.DOTALL)
+
+
+def detect_register_drift(text: str, window_chars: int = 300) -> Optional[tuple[str, str]]:
+    """Scan the tail of `text` for assistant-register markers.
+
+    Returns (matched_pattern, snippet) on the first hit, or None.
+    Bracketed injection fragments are stripped before scanning.
+    """
+    tail = text[-window_chars:] if len(text) > window_chars else text
+    if not tail:
+        return None
+    scrubbed = _BRACKETED.sub(" ", tail)
+    if not scrubbed.strip():
+        return None
+    lower = scrubbed.lower()
+    for phrase in _DRIFT_PHRASES:
+        if phrase.lower() in lower:
+            return phrase, tail
+    for rx, label in _DRIFT_REGEXES:
+        if rx.search(scrubbed):
+            return label, tail
+    return None
+
+
+# ---------- clean-sentence truncation (used by recovery surgery) ----------
+
+# Sentence boundary characters appropriate to the dream register (drop ! and ?
+# — those skew toward assistant/exclamation patterns).
+_CLEAN_BOUNDARIES = (".", "…")
+
+
+def truncate_to_clean_sentence(text: str, max_lookback: int = 500) -> tuple[str, int]:
+    """Walk back from end of `text` up to `max_lookback` chars and truncate
+    at the last boundary character that does NOT sit inside an assistant-
+    register pattern.
+
+    Returns (truncated_text, chars_removed). If no clean boundary is found
+    within the lookback window, hard-cuts at the lookback edge.
+    """
+    if not text:
+        return text, 0
+    start = max(0, len(text) - max_lookback)
+    region = text[start:]
+
+    # Walk backward through sentence boundaries.
+    for i in range(len(region) - 1, -1, -1):
+        if region[i] in _CLEAN_BOUNDARIES:
+            absolute = start + i + 1
+            kept = text[:absolute]
+            # Verify the kept tail doesn't itself end in a triggered region.
+            tail = kept[-max_lookback:]
+            if detect_register_drift(tail) is None:
+                return kept, len(text) - absolute
+
+    # No clean boundary found — hard cut at lookback edge.
+    return text[:start], len(text) - start

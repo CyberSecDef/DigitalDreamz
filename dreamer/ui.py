@@ -33,6 +33,22 @@ class DreamRenderer:
             soft_wrap=True,
         )
 
+    def render_contamination(self, pattern: str, action: str):
+        style = "bold red" if action == "recovered" else "yellow"
+        label = "recovered" if action == "recovered" else "drift"
+        self.console.print(
+            Text(f"\n  ⟂ {label}: {pattern} ⟂\n", style=style),
+            end="",
+            soft_wrap=True,
+        )
+
+    def render_self_state(self, summary: str):
+        self.console.print(
+            Text(f"\n  ◇ self ◇  {summary}\n", style="dim magenta italic"),
+            end="",
+            soft_wrap=True,
+        )
+
     def render_phase_change(self, from_phase: str, to_phase: str):
         self.console.print(
             Text(f"\n  ── {from_phase} → {to_phase} ──\n", style="dim white"),
