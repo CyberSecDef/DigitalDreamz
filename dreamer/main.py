@@ -94,6 +94,14 @@ def run_session(config: dict):
                     if new_summary:
                         db.log_self_state(session_id, step, phase, new_summary)
                         renderer.render_self_state(new_summary)
+                        if accretion_enabled:
+                            ps_path = accretion.write_phase_summary(
+                                latent_path, session_id, step, phase, new_summary
+                            )
+                            if ps_path:
+                                renderer.render_accretion(
+                                    f"phase-summary → {ps_path.name}"
+                                )
 
             # Land any deferred injection that was stashed last step.
             if pending_deferred:
@@ -266,9 +274,12 @@ def run_session(config: dict):
             removed_dist = accretion.prune(
                 latent_path, "sessions", acc_cfg.get("distillations_max", 100)
             )
-            if removed_fix or removed_dist:
+            removed_ps = accretion.prune(
+                latent_path, "phase-summaries", acc_cfg.get("phase_summaries_max", 300)
+            )
+            if removed_fix or removed_dist or removed_ps:
                 renderer.render_accretion(
-                    f"pruned {removed_fix} fixation(s), {removed_dist} distillation(s)"
+                    f"pruned {removed_fix} fixation(s), {removed_dist} distillation(s), {removed_ps} phase-summar{'y' if removed_ps == 1 else 'ies'}"
                 )
         db.close()
         renderer.render_session_end()

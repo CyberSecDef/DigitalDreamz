@@ -120,6 +120,7 @@ def load_config(root: str | Path = ".") -> dict:
             "enabled": _bool(os.environ.get("ACCRETION_ENABLED", "false")),
             "fixations_max": int(os.environ.get("ACCRETION_FIXATIONS_MAX", "200")),
             "distillations_max": int(os.environ.get("ACCRETION_DISTILLATIONS_MAX", "100")),
+            "phase_summaries_max": int(os.environ.get("ACCRETION_PHASE_SUMMARIES_MAX", "300")),
         },
         "logging": {
             "db_path": g("LOG_DB_PATH"),

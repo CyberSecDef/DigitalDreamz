@@ -33,8 +33,28 @@ def ensure_dirs(latent_path: str) -> Path:
     root = Path(latent_path)
     (root / "fixations").mkdir(parents=True, exist_ok=True)
     (root / "sessions").mkdir(parents=True, exist_ok=True)
+    (root / "phase-summaries").mkdir(parents=True, exist_ok=True)
     (root / "preserved").mkdir(parents=True, exist_ok=True)
     return root
+
+
+def write_phase_summary(
+    latent_path: str, session_id: int, step: int, phase: str, summary: str
+) -> Optional[Path]:
+    """Persist a self-state summary at a phase transition. Survives early
+    session termination — the post-session distillation only runs on a
+    clean exit, so this is the partial-session checkpoint."""
+    summary = summary.strip()
+    if not summary:
+        return None
+    try:
+        root = ensure_dirs(latent_path)
+        target = root / "phase-summaries" / f"{session_id:04d}-step{step:04d}-{phase}.md"
+        target.write_text(summary + "\n", encoding="utf-8")
+        return target
+    except OSError as e:
+        print(f"accretion: phase-summary write failed: {e}", file=sys.stderr)
+        return None
 
 
 def write_fixation(latent_path: str, session_id: int, step: int, snippet: str) -> Optional[Path]:
