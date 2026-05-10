@@ -1,0 +1,25 @@
+# Per-file / per-subdirectory weight overrides for the latent corpus.
+# Patterns are fnmatch-style and matched against paths relative to
+# corpus/latent/. Order matters — first matching pattern wins. Files that
+# match no pattern get weight 1.0. Weight 0 excludes a file from sampling
+# without removing it from disk.
+#
+# Format: <pattern> <weight>
+#
+# Examples (commented out — uncomment and tune to taste):
+#
+# fragments.txt        1.5     # short, dense, dream-shaped — favor it
+# cities.txt           1.0
+# rooms.txt            1.0
+# transformations.txt  1.2
+# waterworks.txt       1.0
+# essays/*             0.3     # if an essays subfolder gets added later
+# scratch/*            0       # scratch directory excluded from sampling
+# **/*.gutenberg.txt   1.0     # Project Gutenberg downloads, default weight
+#
+# Active rules:
+README.md            0       # docs file — exclude from sampling
+fixations/*          0.1     # auto: online stickiness captures (Tier A)
+sessions/*           0.5     # auto: post-session distillations (Tier B)
+preserved/*          1.0     # manual: hand-curated material (Tier C)
+

@@ -30,8 +30,10 @@ pip-wheel-metadata/
 dreams*.db
 corpus/today/*
 !corpus/today/.gitkeep
-corpus/latent/*
-!corpus/latent/.gitkeep
+# Latent: track the curated starter pool at the top level, ignore the
+# accretion-generated subdirectories (fixations / sessions / preserved)
+# so auto-grown content stays local-only.
+corpus/latent/*/
 
 # Logs
 *.log
