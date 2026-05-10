@@ -4,7 +4,7 @@ import time
 import random
 import click
 
-from . import prompts, llm, sampler, ui, db as db_mod
+from . import prompts, llm, sampler, ui, db as db_mod, accretion
 from .config import load_config
 from .corpus import Corpus
 from .self_state import SelfState
@@ -34,6 +34,10 @@ def run_session(config: dict):
     stickiness_threshold = float(mon_cfg.get("stickiness_threshold", 0.5))
     stickiness_patience = int(mon_cfg.get("stickiness_patience", 3))
 
+    acc_cfg = config.get("accretion", {})
+    accretion_enabled = bool(acc_cfg.get("enabled", False))
+    latent_path = config["corpus"]["latent"]["path"]
+
     db = db_mod.DB(log_cfg["db_path"])
     renderer = ui.DreamRenderer()
     corpus = Corpus(config)
@@ -52,6 +56,10 @@ def run_session(config: dict):
         config=config,
     )
     renderer.render_session_start(session_id, model_cfg["name"], perspective)
+    renderer.render_legend(
+        self_state_enabled=self_state.enabled,
+        accretion_enabled=accretion_enabled,
+    )
 
     buffer: list[str] = [seed]
     phase_state = sampler.PhaseState()
@@ -59,6 +67,7 @@ def run_session(config: dict):
     last_injection_step = -inj_cfg["base_interval_steps"]
     pending_deferred: list[tuple[str, str]] = []  # (source, fragment) waiting one step
     consecutive_sticky = 0
+    interrupted = False
     start = time.time()
 
     try:
@@ -89,7 +98,7 @@ def run_session(config: dict):
             # Land any deferred injection that was stashed last step.
             if pending_deferred:
                 for src, frag in pending_deferred:
-                    buffer.append(f"\n\n[{frag}]\n\n")
+                    buffer.append(f"\n\n‹{frag}›\n\n")
                 pending_deferred.clear()
 
             # injection decision
@@ -115,7 +124,7 @@ def run_session(config: dict):
                     if injection_mode == "deferred":
                         pending_deferred.append((source, fragment))
                     else:
-                        buffer.append(f"\n\n[{fragment}]\n\n")
+                        buffer.append(f"\n\n‹{fragment}›\n\n")
                     last_injection_step = step
 
             # build prompt — phase-conditional sliding window
@@ -147,7 +156,7 @@ def run_session(config: dict):
             except KeyboardInterrupt:
                 raise
             except Exception as e:
-                renderer.console.print(f"\n[red]API error: {e}[/red]")
+                renderer.render_error(f"API error: {e}")
                 time.sleep(2)
 
             # contamination checks on the freshly extended buffer
@@ -163,10 +172,14 @@ def run_session(config: dict):
                 pattern, snippet = hit
                 truncated, removed = sampler.truncate_to_clean_sentence(full_text)
                 if removed > 0:
-                    buffer = [truncated]
+                    # Wrap the kept prefix as receding background so the model
+                    # has continuity but not a tail to copy. Strip any prior
+                    # markers first so repeat recoveries don't nest.
+                    inner = truncated.replace("‹receding›\n", "").replace("\n‹/receding›", "")
+                    buffer = [f"‹receding›\n{inner}\n‹/receding›\n\n"]
                     recovery = corpus.sample_latent() or ""
                     if recovery:
-                        buffer.append(f"\n\n[{recovery}]\n\n")
+                        buffer.append(f"‹{recovery}›\n\n")
                         db.log_injection(
                             session_id, step, phase, "latent", "recovery", recovery
                         )
@@ -177,6 +190,10 @@ def run_session(config: dict):
                         recovery_fragment=recovery or None,
                     )
                     renderer.render_contamination(f"{kind}: {pattern}", "recovered")
+                    renderer.render_receding_open()
+                    if recovery:
+                        renderer.render_recovery(recovery)
+                    renderer.render_receding_close()
                 else:
                     db.log_contamination(
                         session_id, step, phase, pattern, snippet,
@@ -198,10 +215,16 @@ def run_session(config: dict):
                 if consecutive_sticky >= stickiness_patience:
                     perturb = corpus.sample_latent() or ""
                     if perturb:
-                        buffer.append(f"\n\n[{perturb}]\n\n")
+                        buffer.append(f"\n\n‹{perturb}›\n\n")
                         db.log_injection(
                             session_id, step, phase, "latent", "stickiness", perturb
                         )
+                    if accretion_enabled:
+                        fix_path = accretion.write_fixation(
+                            latent_path, session_id, step, full_text[-500:]
+                        )
+                        if fix_path:
+                            renderer.render_accretion(f"fixation → {fix_path.name}")
                     db.log_contamination(
                         session_id, step, phase,
                         pattern=f"stickiness={score:.2f}",
@@ -219,9 +242,34 @@ def run_session(config: dict):
             step += 1
 
     except KeyboardInterrupt:
-        renderer.console.print("\n[dim]interrupted[/dim]")
+        interrupted = True
+        renderer.render_interrupt()
     finally:
         db.end_session(session_id)
+        if accretion_enabled:
+            if not interrupted:
+                try:
+                    transcript = db.fetch_session_transcript(session_id)
+                except Exception as e:
+                    renderer.render_error(f"transcript fetch failed: {e}")
+                    transcript = ""
+                if transcript.strip():
+                    renderer.render_accretion("distilling session…")
+                    dist_path = accretion.write_distillation(
+                        latent_path, session_id, transcript, model_cfg
+                    )
+                    if dist_path:
+                        renderer.render_accretion(f"distilled → sessions/{dist_path.name}")
+            removed_fix = accretion.prune(
+                latent_path, "fixations", acc_cfg.get("fixations_max", 200)
+            )
+            removed_dist = accretion.prune(
+                latent_path, "sessions", acc_cfg.get("distillations_max", 100)
+            )
+            if removed_fix or removed_dist:
+                renderer.render_accretion(
+                    f"pruned {removed_fix} fixation(s), {removed_dist} distillation(s)"
+                )
         db.close()
         renderer.render_session_end()
 

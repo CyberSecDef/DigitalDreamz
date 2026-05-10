@@ -168,5 +168,12 @@ class DB:
             (session_id, step, time.time(), phase, summary),
         )
 
+    def fetch_session_transcript(self, session_id: int) -> str:
+        cur = self.conn.execute(
+            "SELECT token FROM tokens WHERE session_id = ? ORDER BY step, id",
+            (session_id,),
+        )
+        return "".join(row[0] for row in cur)
+
     def close(self):
         self.conn.close()

@@ -116,6 +116,11 @@ def load_config(root: str | Path = ".") -> dict:
         "self_state": {
             "enabled": _bool(os.environ.get("SELF_STATE_ENABLED", "false")),
         },
+        "accretion": {
+            "enabled": _bool(os.environ.get("ACCRETION_ENABLED", "false")),
+            "fixations_max": int(os.environ.get("ACCRETION_FIXATIONS_MAX", "200")),
+            "distillations_max": int(os.environ.get("ACCRETION_DISTILLATIONS_MAX", "100")),
+        },
         "logging": {
             "db_path": g("LOG_DB_PATH"),
             "echo_to_stdout": _bool(g("LOG_ECHO_TO_STDOUT")),
