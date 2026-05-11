@@ -41,11 +41,15 @@ def run_session(config: dict):
     db = db_mod.DB(log_cfg["db_path"])
     renderer = ui.DreamRenderer()
     corpus = Corpus(config)
+    usage = llm.UsageTracker()
     self_state = SelfState(
         model_cfg=model_cfg,
         sampling_cfg=samp_cfg,
         enabled=config.get("self_state", {}).get("enabled", False),
+        tracker=usage,
     )
+    usage_report_interval = 60.0
+    last_usage_report = time.time()
 
     base_sys_prompt = prompts.system_prompt(perspective)
     seed = prompts.random_seed(perspective)
@@ -157,6 +161,7 @@ def run_session(config: dict):
                     temperature=round(temp, 3),
                     top_p=samp_cfg["top_p"],
                     max_tokens=samp_cfg["max_tokens_per_step"],
+                    tracker=usage,
                 ):
                     buffer.append(tok)
                     db.log_token(session_id, step, temp, phase, tok)
@@ -178,16 +183,10 @@ def run_session(config: dict):
                 if hit is None:
                     continue
                 pattern, snippet = hit
-                truncated, removed = sampler.truncate_to_clean_sentence(full_text)
+                new_buf, recovery, removed = _recovery_surgery(full_text, corpus)
                 if removed > 0:
-                    # Wrap the kept prefix as receding background so the model
-                    # has continuity but not a tail to copy. Strip any prior
-                    # markers first so repeat recoveries don't nest.
-                    inner = truncated.replace("‹receding›\n", "").replace("\n‹/receding›", "")
-                    buffer = [f"‹receding›\n{inner}\n‹/receding›\n\n"]
-                    recovery = corpus.sample_latent() or ""
+                    buffer = new_buf
                     if recovery:
-                        buffer.append(f"‹{recovery}›\n\n")
                         db.log_injection(
                             session_id, step, phase, "latent", "recovery", recovery
                         )
@@ -212,8 +211,10 @@ def run_session(config: dict):
                 consecutive_sticky = 0
                 break  # one recovery per step is plenty
 
-            # register-stickiness — softer signal, fires only when patience
-            # exhausted and only triggers a perturbation injection (no truncation).
+            # register-stickiness — fires when content-word recycling stays
+            # above threshold for `patience` consecutive samples. Uses the same
+            # truncate-and-wrap surgery as register/topical recovery so the
+            # model can't continue from its own paragraph.
             if not handled and stickiness_enabled:
                 score = sampler.register_stickiness(full_text)
                 if score >= stickiness_threshold:
@@ -221,33 +222,45 @@ def run_session(config: dict):
                 else:
                     consecutive_sticky = 0
                 if consecutive_sticky >= stickiness_patience:
-                    perturb = corpus.sample_latent() or ""
-                    if perturb:
-                        buffer.append(f"\n\n‹{perturb}›\n\n")
-                        db.log_injection(
-                            session_id, step, phase, "latent", "stickiness", perturb
-                        )
                     if accretion_enabled:
                         fix_path = accretion.write_fixation(
                             latent_path, session_id, step, full_text[-500:]
                         )
                         if fix_path:
                             renderer.render_accretion(f"fixation → {fix_path.name}")
-                    db.log_contamination(
-                        session_id, step, phase,
-                        pattern=f"stickiness={score:.2f}",
-                        snippet=full_text[-300:],
-                        action="recovered" if perturb else "logged",
-                        kind="stickiness",
-                        recovery_fragment=perturb or None,
-                    )
-                    renderer.render_contamination(
-                        f"stickiness={score:.2f}",
-                        "recovered" if perturb else "logged",
-                    )
+                    new_buf, recovery, removed = _recovery_surgery(full_text, corpus)
+                    pattern = f"stickiness={score:.2f}"
+                    snippet = full_text[-300:]
+                    if removed > 0:
+                        buffer = new_buf
+                        if recovery:
+                            db.log_injection(
+                                session_id, step, phase, "latent", "stickiness", recovery
+                            )
+                        db.log_contamination(
+                            session_id, step, phase, pattern, snippet,
+                            action="recovered", kind="stickiness",
+                            truncated_chars=removed,
+                            recovery_fragment=recovery or None,
+                        )
+                        renderer.render_contamination(pattern, "recovered")
+                        renderer.render_receding_open()
+                        if recovery:
+                            renderer.render_recovery(recovery)
+                        renderer.render_receding_close()
+                    else:
+                        db.log_contamination(
+                            session_id, step, phase, pattern, snippet,
+                            action="logged", kind="stickiness",
+                        )
+                        renderer.render_contamination(pattern, "logged")
                     consecutive_sticky = 0
 
             step += 1
+
+            if time.time() - last_usage_report >= usage_report_interval:
+                renderer.render_usage(usage.snapshot_and_reset_delta())
+                last_usage_report = time.time()
 
     except KeyboardInterrupt:
         interrupted = True
@@ -264,7 +277,7 @@ def run_session(config: dict):
                 if transcript.strip():
                     renderer.render_accretion("distilling session…")
                     dist_path = accretion.write_distillation(
-                        latent_path, session_id, transcript, model_cfg
+                        latent_path, session_id, transcript, model_cfg, tracker=usage
                     )
                     if dist_path:
                         renderer.render_accretion(f"distilled → sessions/{dist_path.name}")
@@ -281,8 +294,30 @@ def run_session(config: dict):
                 renderer.render_accretion(
                     f"pruned {removed_fix} fixation(s), {removed_dist} distillation(s), {removed_ps} phase-summar{'y' if removed_ps == 1 else 'ies'}"
                 )
+        renderer.render_usage(usage.snapshot_and_reset_delta())
         db.close()
         renderer.render_session_end()
+
+
+def _recovery_surgery(
+    full_text: str, corpus
+) -> tuple[list[str], str, int]:
+    """Truncate the buffer to a clean sentence boundary, wrap the kept prefix
+    as receding background, and append a fresh latent fragment. Returns
+    (new_buffer, recovery_fragment, removed_chars). If no clean boundary is
+    available, returns ([], '', 0) and the caller should keep the existing
+    buffer. No rendering or logging side effects — caller orchestrates those
+    so each trigger (register, topical, stickiness) can label them itself.
+    """
+    truncated, removed = sampler.truncate_to_clean_sentence(full_text)
+    if removed <= 0:
+        return [], "", 0
+    inner = truncated.replace("‹receding›\n", "").replace("\n‹/receding›", "")
+    new_buffer = [f"‹receding›\n{inner}\n‹/receding›\n\n"]
+    recovery = corpus.sample_latent() or ""
+    if recovery:
+        new_buffer.append(f"‹{recovery}›\n\n")
+    return new_buffer, recovery, removed
 
 
 def _trim_buffer(buffer: list[str], approx_token_budget: int) -> str:

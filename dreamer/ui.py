@@ -72,6 +72,25 @@ class DreamRenderer:
         distilled, prune cleanup)."""
         self._print_system(f"✎ {message}", "dim green")
 
+    def render_usage(self, snap: dict):
+        """Periodic token/cost report. snap comes from UsageTracker.snapshot_and_reset_delta."""
+        def fmt(n: int) -> str:
+            return f"{n:,}"
+        approx_marker = "~" if snap.get("approx") else ""
+        cost_total = snap["cost_total"]
+        cost_delta = snap["cost_delta"]
+        if cost_total > 0:
+            cost_str = f"  ${cost_total:.4f} (Δ ${cost_delta:.4f})"
+        else:
+            cost_str = "  $— (no rate for model)"
+        line = (
+            f"$ tokens {approx_marker}in: {fmt(snap['prompt_total'])}  "
+            f"out: {fmt(snap['completion_total'])}    "
+            f"Δ60s in:+{fmt(snap['prompt_delta'])}  out:+{fmt(snap['completion_delta'])}"
+            f"{cost_str}"
+        )
+        self._print_system(line, "dim yellow")
+
     def render_phase_change(self, from_phase: str, to_phase: str):
         self._print_system(f"── {from_phase} → {to_phase} ──", "dim white")
 

@@ -38,6 +38,7 @@ corpus/latent/*/
 # Logs
 *.log
 logs/
+dreamlog/
 
 # Test / coverage
 .pytest_cache/

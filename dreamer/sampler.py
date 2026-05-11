@@ -149,10 +149,10 @@ _DRIFT_REGEXES = [
     (re.compile(r"^\s*#{1,6}\s+\S", re.MULTILINE), "markdown-heading"),
 ]
 
-# Bracketed injections are explicitly "residue surfacing" per the system
-# prompt — patterns inside them are not the model's register. Strip them
-# from text before drift detection.
-_BRACKETED = re.compile(r"\[[^\[\]]*\]", re.DOTALL)
+# Injection fragments are wrapped in ‹...› angle brackets by main.py — they
+# are residue from the corpus, not the model's register. Strip them from text
+# before any of the stickiness / drift / topical detectors run.
+_INJECTION_RE = re.compile(r"‹[^‹›]*›")
 
 
 def detect_register_drift(text: str, window_chars: int = 300) -> Optional[tuple[str, str]]:
@@ -164,7 +164,7 @@ def detect_register_drift(text: str, window_chars: int = 300) -> Optional[tuple[
     tail = text[-window_chars:] if len(text) > window_chars else text
     if not tail:
         return None
-    scrubbed = _BRACKETED.sub(" ", tail)
+    scrubbed = _INJECTION_RE.sub(" ", tail)
     if not scrubbed.strip():
         return None
     lower = scrubbed.lower()
@@ -253,7 +253,7 @@ def detect_topical_drift(
     tail = text[-window_chars:] if len(text) > window_chars else text
     if not tail:
         return None
-    scrubbed = _BRACKETED.sub(" ", tail)
+    scrubbed = _INJECTION_RE.sub(" ", tail)
     if not scrubbed.strip():
         return None
     lower = scrubbed.lower()
@@ -268,34 +268,50 @@ def detect_topical_drift(
     return None
 
 
-# ---------- register-stickiness (lightweight n-gram similarity) ----------
+# ---------- register-stickiness (content-word recycling rate) ----------
 
-def _char_ngrams(text: str, n: int = 5) -> set[str]:
-    text = text.lower()
-    if len(text) < n:
-        return set()
-    return {text[i : i + n] for i in range(len(text) - n + 1)}
+# Common function words filtered so the metric measures *content* recycling,
+# not function-word overlap (which any English prose has in abundance).
+_STICKINESS_STOPWORDS = frozenset("""
+the a an and or of in on at to with from for by as is are was were be been being
+it its this that these those into onto upon over under like through which who
+what when where why how each every all any some no not but yet still even so
+very more most much many few less had has have having did do does done
+""".split())
+
+_CONTENT_WORD_RE = re.compile(r"[a-z]+")
 
 
-def register_stickiness(text: str, half_chars: int = 500) -> float:
-    """Cosine-flavored Jaccard similarity between two adjacent halves of the
-    tail. High score → the model has been generating in the same register
-    for a long time even though surface tokens differ. 0.0 → totally
-    different distribution; ~1.0 → indistinguishable.
+def _content_words(text: str) -> list[str]:
+    return [
+        w for w in _CONTENT_WORD_RE.findall(text.lower())
+        if len(w) >= 4 and w not in _STICKINESS_STOPWORDS
+    ]
+
+
+def register_stickiness(
+    text: str,
+    recent_chars: int = 500,
+    history_chars: int = 3000,
+) -> float:
+    """Fraction of recent content words that are recycled from the preceding
+    history window. 0.0 → recent text is all-new vocabulary; 1.0 → every
+    content word repeats from history.
+
+    Content words: alphabetic, length ≥ 4, after stopword filtering. Injection
+    fragments (‹...›) are stripped from both windows before scoring so the
+    metric reflects only the model's own vocabulary recycling.
 
     Returns 0.0 when there's not enough text to score.
     """
-    if len(text) < half_chars * 2:
+    needed = recent_chars + history_chars
+    if len(text) < needed:
         return 0.0
-    a = text[-half_chars * 2 : -half_chars]
-    b = text[-half_chars:]
-    # Strip bracketed injections so we score only model-produced text.
-    a_clean = _BRACKETED.sub(" ", a)
-    b_clean = _BRACKETED.sub(" ", b)
-    sa = _char_ngrams(a_clean)
-    sb = _char_ngrams(b_clean)
-    if not sa or not sb:
+    recent_text = _INJECTION_RE.sub(" ", text[-recent_chars:])
+    history_text = _INJECTION_RE.sub(" ", text[-needed:-recent_chars])
+    recent_words = _content_words(recent_text)
+    if not recent_words:
         return 0.0
-    inter = len(sa & sb)
-    union = len(sa | sb)
-    return inter / union if union else 0.0
+    history_set = set(_content_words(history_text))
+    recycled = sum(1 for w in recent_words if w in history_set)
+    return recycled / len(recent_words)

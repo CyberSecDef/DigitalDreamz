@@ -19,8 +19,8 @@
 #
 # Active rules:
 README.md            0       # docs file — exclude from sampling
-fixations/*          0.1     # auto: online stickiness captures (Tier A)
-phase-summaries/*    0.3     # auto: per-phase self-state checkpoints (Tier A.5)
+fixations/*          0       # auto: online stickiness captures — excluded; sampling them feeds back the stuck register
+phase-summaries/*    0       # auto: per-phase self-state checkpoints — kept on disk for self_state continuity, but not injection material
 sessions/*           0.5     # auto: post-session distillations (Tier B)
 preserved/*          1.0     # manual: hand-curated material (Tier C)
 

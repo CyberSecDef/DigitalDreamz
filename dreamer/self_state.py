@@ -22,11 +22,12 @@ _MAX_SUMMARY_CHARS = 800
 class SelfState:
     """Holds the current self-summary and knows how to refresh it."""
 
-    def __init__(self, model_cfg: dict, sampling_cfg: dict, enabled: bool = False):
+    def __init__(self, model_cfg: dict, sampling_cfg: dict, enabled: bool = False, tracker=None):
         self.model_cfg = model_cfg
         self.sampling_cfg = sampling_cfg
         self.enabled = enabled
         self.summary: str = ""
+        self.tracker = tracker
 
     def ambient_prefix(self) -> str:
         """String to prepend to the system prompt for this generation."""
@@ -61,6 +62,7 @@ class SelfState:
                 temperature=0.6,
                 top_p=0.9,
                 max_tokens=200,
+                tracker=self.tracker,
             )
         except Exception:
             return self.summary

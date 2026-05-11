@@ -79,6 +79,7 @@ def write_distillation(
     session_id: int,
     transcript: str,
     model_cfg: dict,
+    tracker=None,
 ) -> Optional[Path]:
     """Tier B: one-shot summary of the session transcript, written to
     sessions/. Returns the path written, or None on failure / empty input."""
@@ -95,6 +96,7 @@ def write_distillation(
             temperature=0.6,
             top_p=0.9,
             max_tokens=600,
+            tracker=tracker,
         )
     except Exception as e:
         print(f"accretion: distillation LLM call failed: {e}", file=sys.stderr)
