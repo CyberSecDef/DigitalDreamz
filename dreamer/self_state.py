@@ -67,7 +67,7 @@ class SelfState:
         except Exception:
             return self.summary
 
-        text = sampler.strip_brackets(text)
+        text = sampler.redact_date_leaks(sampler.strip_brackets(text))
         if len(text) > _MAX_SUMMARY_CHARS:
             text = text[:_MAX_SUMMARY_CHARS].rstrip() + "…"
         self.summary = text

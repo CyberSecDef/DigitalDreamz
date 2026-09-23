@@ -47,13 +47,36 @@ def test_claude_code_streams_text_and_records_usage(tmp_path, monkeypatch):
     assert tracker.cost_total == pytest.approx(0.0025)
 
 
-def test_claude_code_cuts_stream_at_token_budget(tmp_path, monkeypatch):
+def test_claude_code_runs_on_to_sentence_end(tmp_path, monkeypatch):
+    # 40-char budget lands mid-sentence; the step ends at the next full stop.
+    deltas = ["The hallway outside ", "keeps forgetting to end. ", "It goes ", "and goes."]
     monkeypatch.setenv("CLAUDE_CODE_BIN", _fake_claude(
-        tmp_path, [_delta("x" * 30)] * 10, sleep=30))
+        tmp_path, [_delta(d) for d in deltas], sleep=30))
     tracker = llm.UsageTracker()
-    out = "".join(_stream(max_tokens=10, tracker=tracker))  # 40-char budget
-    assert out == "x" * 40
+    out = "".join(_stream(max_tokens=10, tracker=tracker))
+    assert out == "The hallway outside keeps forgetting to end. "
     assert tracker.had_approx
+
+
+def test_claude_code_hard_cap_cuts_at_word_boundary(tmp_path, monkeypatch):
+    # No sentence end before 1.5x budget (60 chars): stop at a word edge.
+    words = [_delta("drift ")] * 20
+    monkeypatch.setenv("CLAUDE_CODE_BIN", _fake_claude(tmp_path, words, sleep=30))
+    out = "".join(_stream(max_tokens=10))
+    assert out.strip() and len(out) <= 60
+    assert all(w == "drift" for w in out.split())
+
+
+@pytest.mark.parametrize("text,emitted,expected", [
+    ("abc", 0, ("abc", False)),                           # under budget
+    ("end of it. More", 5, ("end of it. ", True)),         # sentence end past budget
+    ("ok.” Then", 9, ("ok.” ", True)),                     # closing quote kept
+    ("line\nnext", 8, ("line\n", True)),                   # newline is a boundary
+    ("to the end.", 8, ("to the end. ", True)),            # sentence end at delta edge
+    ("so it goes and goes", 8, ("so it goes and goes", False)),  # still under cap
+])
+def test_clip_at_budget(text, emitted, expected):
+    assert llm._clip_at_budget(text, emitted, budget=10, hard_cap=30) == expected
 
 
 def test_claude_code_error_result_raises(tmp_path, monkeypatch):

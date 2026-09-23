@@ -3,6 +3,11 @@
 # case-insensitively; multi-word entries are matched as case-insensitive
 # substrings. Lines starting with # and blank lines are ignored.
 #
+# Dream prose wakes, sleeps and lacks agendas literally, so words like that
+# only appear here inside phrases that carry the commentary framing. Every
+# historical hit on bare `woke`, `wake up` and `agenda` was a false positive
+# ("I woke early", "sockets hum, without agenda").
+#
 # Tune freely — these are the spec's starter set, not a fixed rule.
 
 # Political / ideological
@@ -11,7 +16,9 @@ vaccination
 vaxx
 denier
 deniers
-woke
+stay woke
+woke mob
+woke agenda
 wokeness
 cancel culture
 cancelled
@@ -28,9 +35,14 @@ radical
 # Conspiracy-adjacent
 globalist
 elites
-agenda
+hidden agenda
+globalist agenda
+political agenda
+their agenda
 they don't want you to know
-wake up
+wake up, sheeple
+wake up people
+sheeple
 
 # Health / diet flashpoints
 vegan agenda

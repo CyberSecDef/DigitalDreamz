@@ -75,6 +75,8 @@ def run_session(config: dict):
     # watch for it surfacing in the dream (see llm module docstring).
     watch_harness = llm.is_claude_code(model_cfg["provider"]) and not llm.claude_code_bare()
     leak_terms = llm.claude_code_leak_terms() if watch_harness else ()
+    # The date line survives even --bare, so watch for it on every Claude Code run.
+    watch_date = llm.is_claude_code(model_cfg["provider"])
 
     topical_patterns = sampler.load_topical_patterns(
         mon_cfg.get("topical_blocklist_path", "")
@@ -131,10 +133,27 @@ def run_session(config: dict):
     interrupted = False
     start = time.time()
 
-    def apply_recovery(full_text, kind, pattern, snippet, trigger, phase):
+    # Contamination detectors, in priority order: (kind, fn(text, window)).
+    detectors = [
+        ("register", sampler.detect_register_drift),
+        ("topical", lambda t, w: sampler.detect_topical_drift(t, topical_patterns, w)),
+    ]
+    if watch_date:
+        detectors.insert(0, ("date", sampler.detect_date_leak))
+    if watch_harness:
+        detectors.insert(0, (
+            "harness", lambda t, w: sampler.detect_harness_leak(t, w, leak_terms),
+        ))
+
+    def apply_recovery(full_text, kind, pattern, snippet, trigger, phase, scan_chars):
         """Run recovery surgery and log/render it. Returns the new buffer, or
-        None if there was no clean boundary to cut at."""
-        new_buf, recovery, removed = _recovery_surgery(full_text, corpus)
+        None if there was no clean boundary to cut at. The kept text must
+        pass every detector over the same window that was scanned."""
+        def is_clean(kept: str) -> bool:
+            return all(fn(kept, scan_chars) is None for _, fn in detectors)
+        new_buf, recovery, removed = _recovery_surgery(
+            full_text, corpus, is_clean, max(500, scan_chars + 100)
+        )
         if removed <= 0:
             db.log_contamination(
                 session_id, step, phase, pattern, snippet,
@@ -275,20 +294,14 @@ def run_session(config: dict):
             scan_chars = max(_MIN_SCAN_CHARS, step_chars + _SCAN_OVERLAP_CHARS)
             handled = False
 
-            checks = [
-                ("register", sampler.detect_register_drift(full_text, scan_chars)),
-                ("topical",  sampler.detect_topical_drift(full_text, topical_patterns, scan_chars)),
-            ]
-            if watch_harness:
-                checks.insert(0, (
-                    "harness",
-                    sampler.detect_harness_leak(full_text, scan_chars, leak_terms),
-                ))
-            for kind, hit in checks:
+            for kind, detect in detectors:
+                hit = detect(full_text, scan_chars)
                 if hit is None:
                     continue
                 pattern, snippet = hit
-                new_buf = apply_recovery(full_text, kind, pattern, snippet, "recovery", phase)
+                new_buf = apply_recovery(
+                    full_text, kind, pattern, snippet, "recovery", phase, scan_chars
+                )
                 if new_buf is not None:
                     buffer = new_buf
                 handled = True
@@ -314,7 +327,7 @@ def run_session(config: dict):
                             renderer.render_accretion(f"fixation → {fix_path.name}")
                     new_buf = apply_recovery(
                         full_text, "stickiness", f"stickiness={score:.2f}",
-                        full_text[-300:], "stickiness", phase,
+                        full_text[-300:], "stickiness", phase, scan_chars,
                     )
                     if new_buf is not None:
                         buffer = new_buf
@@ -362,7 +375,7 @@ def run_session(config: dict):
 
 
 def _recovery_surgery(
-    full_text: str, corpus
+    full_text: str, corpus, is_clean=None, max_lookback: int = 500
 ) -> tuple[list[str], str, int]:
     """Truncate the buffer to a clean sentence boundary, wrap the kept prefix
     as receding background, and append a fresh latent fragment. Returns
@@ -371,7 +384,9 @@ def _recovery_surgery(
     buffer. No rendering or logging side effects — caller orchestrates those
     so each trigger (register, topical, stickiness) can label them itself.
     """
-    truncated, removed = sampler.truncate_to_clean_sentence(full_text)
+    truncated, removed = sampler.truncate_to_clean_sentence(
+        full_text, max_lookback, is_clean
+    )
     if removed <= 0:
         return [], "", 0
     inner = truncated.replace("‹receding›\n", "").replace("\n‹/receding›", "")

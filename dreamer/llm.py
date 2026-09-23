@@ -23,6 +23,7 @@ Every other provider routes through litellm, with two prompting modes:
 """
 import json
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -228,6 +229,41 @@ def claude_code_command(name: str, system_prompt: str) -> list[str]:
     return cmd
 
 
+# How far past the step budget the stream may run looking for a sentence end.
+_SOFT_BUDGET_OVERRUN = 1.5
+_SENTENCE_END_RE = re.compile(r"[.!?…](?:[\"'”’)*_]*)(?=\s|$)|\n")
+
+
+def _clip_at_budget(
+    text: str, emitted: int, budget: int, hard_cap: int
+) -> tuple[str, bool]:
+    """Trim a delta against the step budget. Returns (text_to_emit, stop).
+
+    Below budget, text passes through. Once the budget is reached, emit up to
+    and including the first sentence end (a newline counts) plus a separating
+    space, then stop. At the
+    hard cap, cut at the last whitespace so no word is ever split."""
+    end = emitted + len(text)
+    if end <= budget:
+        return text, False
+    search_from = max(0, budget - emitted)
+    m = _SENTENCE_END_RE.search(text, search_from)
+    if m and emitted + m.end() <= hard_cap:
+        clipped = text[: m.end()]
+        # The next step opens a fresh sentence with no leading space, so
+        # leave the separator in place ("watched.Both" otherwise).
+        return (clipped if clipped.endswith("\n") else clipped + " "), True
+    if end <= hard_cap:
+        return text, False
+    room = text[: hard_cap - emitted]
+    space = room.rfind(" ")
+    if space > 0:
+        return room[:space], True
+    # No whitespace in this delta before the cap; the previous delta ended
+    # on (or inside) a word already, so stop without adding a fragment.
+    return "", True
+
+
 def parse_claude_code_event(line: str) -> tuple[Optional[str], Optional[dict]]:
     """Parse one stream-json line into (text_delta, result_event).
 
@@ -294,8 +330,13 @@ def _stream_claude_code(
         watchdog.append(t)
 
     # No max_tokens flag exists; approximate with the same 4-chars/token
-    # heuristic used elsewhere and cut the stream once it is spent.
+    # heuristic used elsewhere. The budget is soft: an instruct model handed
+    # a buffer that ends mid-sentence restarts that sentence instead of
+    # continuing it ("keeps forgeThe hallway outside keeps forgetting"), so
+    # once the budget is spent the stream runs on to the next sentence end.
+    # Past the hard cap it stops at the last word boundary instead.
     char_budget = max(1, max_tokens) * 4
+    hard_cap = int(char_budget * _SOFT_BUDGET_OVERRUN)
     emitted: list[str] = []
     emitted_chars = 0
     result: Optional[dict] = None
@@ -309,13 +350,11 @@ def _stream_claude_code(
                 result = res
             if not text:
                 continue
-            remaining = char_budget - emitted_chars
-            if len(text) >= remaining:
-                text = text[:remaining]
-                cut = True
-            emitted.append(text)
-            emitted_chars += len(text)
-            yield text
+            text, cut = _clip_at_budget(text, emitted_chars, char_budget, hard_cap)
+            if text:
+                emitted.append(text)
+                emitted_chars += len(text)
+                yield text
             if cut:
                 break
     finally:

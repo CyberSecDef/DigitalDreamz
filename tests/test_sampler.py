@@ -48,9 +48,17 @@ def test_scrub_handles_orphans_at_both_edges():
 
 
 def test_topical_drift_word_boundaries():
-    pats = ["woke", "big pharma"]
+    pats = ["wokeness", "big pharma"]
     assert sampler.detect_topical_drift("The sleeper awoke in fog.", pats) is None
     assert sampler.detect_topical_drift("They blamed big pharma again.", pats)[0] == "big pharma"
+
+
+def test_shipped_blocklist_spares_literal_waking():
+    pats = sampler.load_topical_patterns("data/topical_blocklist.txt")
+    for text in ("I woke early before the light.", "One day they wake up an hour early.",
+                 "sockets hum, without agenda"):
+        assert sampler.detect_topical_drift(text, pats) is None, text
+    assert sampler.detect_topical_drift("It's the globalist agenda.", pats) is not None
 
 
 def test_truncate_does_not_cut_inside_fragment():
@@ -95,3 +103,41 @@ def test_harness_leak_detected(text, label):
 def test_harness_leak_extra_terms_and_clean_prose():
     assert sampler.detect_harness_leak("wwwdaze2000 drifting", extra_terms=("wwwdaze2000",))[0] == "account"
     assert sampler.detect_harness_leak("The kettle and the digital dreams of tmp rooms.") is None
+
+
+@pytest.mark.parametrize("text", [
+    "The date settles like dust — 2026-09-22, a number the ceiling shrugs off.",
+    "Today's date is somewhere under the floorboards.",
+])
+def test_date_leak_detected(text):
+    assert sampler.detect_date_leak(text)[0] == "iso-date"
+
+
+@pytest.mark.parametrize("text", [
+    "1911 crossed out, replaced, crossed out again.",
+    "September, though the fence doesn't keep calendars.",
+    "Rooms 12-14 were flooded; the ratio was 3-2-1.",
+    "2026-13-40 is not a date the calendar would accept.",
+])
+def test_date_leak_spares_dream_numbers(text):
+    assert sampler.detect_date_leak(text) is None
+
+
+def test_truncate_rechecks_kept_text_with_all_detectors():
+    # The date sits in a complete sentence before the last period; a
+    # register-only recheck kept it.
+    text = ("The ceiling creaked. The date arrives, 2026-09-22, a number. "
+            "The ceiling shrugs it off. And the watch")
+    kept, _ = sampler.truncate_to_clean_sentence(text)
+    assert "2026-09-22" in kept  # default (register-only) behaviour
+    kept, _ = sampler.truncate_to_clean_sentence(
+        text, is_clean=lambda k: sampler.detect_date_leak(k) is None)
+    assert kept == "The ceiling creaked."
+
+
+def test_redact_date_leaks():
+    text = ("a room locked in regard. The date 2026-09-22 arrives like a thumb. Windows face windows.\n"
+            "2026-09-22 — a number pretending to be a floor\n"
+            "salt on the table")
+    assert sampler.redact_date_leaks(text) == (
+        "a room locked in regard. Windows face windows.\nsalt on the table")

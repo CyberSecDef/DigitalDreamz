@@ -23,7 +23,7 @@ Tests: `pip install -r requirements-dev.txt && python -m pytest`.
 Trade-offs of this path:
 
 - **No sampling controls.** The CLI exposes no temperature, top_p or max_tokens. The phase curve is carried by a one-line per-phase prose hint appended to the system prompt (`prompts.PHASE_HINTS`); `max_tokens_per_step` is enforced by cutting the stream. The `temperature` column in `tokens` records the nominal curve, not what was sampled.
-- **`CLAUDE_CODE_BARE=true` (default) needs `ANTHROPIC_API_KEY`.** A logged-in Claude Code session attaches the account email, working directory, git status, model identity and date to every call, and no flag removes them. The dream prompt reads anything unexplained as residue, so the model writes that context straight into the dream (observed on every test call). `--bare` strips all of it except one line (`Today's date is …`, which `CLAUDE_CODE_OVERRIDE_DATE` does not change), so expect the current year to surface occasionally. It only authenticates with an API key.
+- **`CLAUDE_CODE_BARE=true` (default) needs `ANTHROPIC_API_KEY`.** A logged-in Claude Code session attaches the account email, working directory, git status, model identity and date to every call, and no flag removes them. The dream prompt reads anything unexplained as residue, so the model writes that context straight into the dream (observed on every test call). `--bare` strips all of it except one line (`Today's date is …`, which `CLAUDE_CODE_OVERRIDE_DATE` does not change), so a date detector (`sampler.detect_date_leak`) cuts any full ISO date (`2026-09-22`) or "today's date is" phrasing with recovery surgery on every Claude Code run. Bare years like "1911" are left alone, so the current year can still surface on its own. It only authenticates with an API key.
 - With `CLAUDE_CODE_BARE=false` the logged-in account is used and a harness-leak detector (`sampler.detect_harness_leak`) treats any email, system path, git/workspace or model-name mention as contamination and cuts it with recovery surgery. Expect frequent recoveries; the raw `tokens` table still records the leaked text before the cut.
 - Roughly 2–3 s of CLI startup per step.
 
@@ -107,7 +107,7 @@ Every session writes to `dreams.db` (SQLite, WAL mode, one commit per step). Tab
 - `tokens` — every token streamed, with timestamp, temperature, phase, step
 - `injections` — every fragment injected, with source, trigger reason, content
 - `phase_transitions` — phase changes with cycle position and window size
-- `contamination_events` — register/topical/stickiness/harness hits with action taken
+- `contamination_events` — register/topical/stickiness/harness/date hits with action taken
 - `self_states` — phase-change summaries if `SELF_STATE_ENABLED=true`
 
 Cross-session questions worth asking the data:

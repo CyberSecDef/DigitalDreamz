@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS contamination_events (
     step INTEGER NOT NULL,
     ts REAL NOT NULL,
     phase TEXT NOT NULL,
-    kind TEXT NOT NULL DEFAULT 'register',   -- 'register' | 'topical' | 'stickiness' | 'harness'
+    kind TEXT NOT NULL DEFAULT 'register',   -- 'register' | 'topical' | 'stickiness' | 'harness' | 'date'
     pattern TEXT NOT NULL,
     snippet TEXT NOT NULL,
     action TEXT NOT NULL,             -- 'logged' | 'recovered'

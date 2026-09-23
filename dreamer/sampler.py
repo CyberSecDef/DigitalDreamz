@@ -8,7 +8,7 @@ import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 
 PHASE_BOUNDARIES = [
@@ -219,10 +219,18 @@ def detect_register_drift(text: str, window_chars: int = 300) -> Optional[tuple[
 _CLEAN_BOUNDARIES = (".", "…")
 
 
-def truncate_to_clean_sentence(text: str, max_lookback: int = 500) -> tuple[str, int]:
+def truncate_to_clean_sentence(
+    text: str,
+    max_lookback: int = 500,
+    is_clean: Optional[Callable[[str], bool]] = None,
+) -> tuple[str, int]:
     """Walk back from end of `text` up to `max_lookback` chars and truncate
-    at the last boundary character that does NOT sit inside an assistant-
-    register pattern or inside an injected ‹…› fragment.
+    at the last boundary character where the kept text passes `is_clean`
+    and the boundary is not inside an injected ‹…› fragment.
+
+    `is_clean` should run every detector that could have fired: checking
+    only register drift let a date or email in an earlier, complete sentence
+    survive the cut. Defaults to the register-drift check alone.
 
     Returns (truncated_text, chars_removed). If no clean boundary is found
     within the lookback window, hard-cuts at the lookback edge (backed off
@@ -230,6 +238,9 @@ def truncate_to_clean_sentence(text: str, max_lookback: int = 500) -> tuple[str,
     """
     if not text:
         return text, 0
+    if is_clean is None:
+        def is_clean(kept: str) -> bool:
+            return detect_register_drift(kept) is None
     start = max(0, len(text) - max_lookback)
     region = text[start:]
 
@@ -240,7 +251,7 @@ def truncate_to_clean_sentence(text: str, max_lookback: int = 500) -> tuple[str,
         kept = text[:absolute]
         if kept.rfind("‹") > kept.rfind("›"):
             continue  # boundary is inside an injected fragment
-        if detect_register_drift(kept) is None:
+        if is_clean(kept):
             return kept, len(text) - absolute
 
     cut = start
@@ -282,6 +293,42 @@ def detect_harness_leak(
     for term in extra_terms:
         if term and term.lower() in lower:
             return "account", tail
+    return None
+
+
+# ---------- date leak (the one line --bare can't strip) ----------
+
+# Claude Code attaches "Today's date is YYYY-MM-DD." to every call, bare mode
+# included, and the dream picks it up verbatim. A full ISO date is never
+# dream material, so it is safe to cut; a bare year ("1911") is left alone.
+_DATE_LEAK_RE = re.compile(
+    r"\b(?:19|20)\d\d-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])\b"
+    r"|\btoday's date is\b",
+    re.IGNORECASE,
+)
+
+
+def redact_date_leaks(text: str) -> str:
+    """Drop every sentence carrying an ISO date or the harness date line
+    from generated text (summaries, distillations). The aux model receives
+    the same date line as the dreamer and adds it on its own."""
+    out_lines = []
+    for line in text.splitlines():
+        if not _DATE_LEAK_RE.search(line):
+            out_lines.append(line)
+            continue
+        kept = [s for s in re.split(r"(?<=[.!?…])\s+", line) if not _DATE_LEAK_RE.search(s)]
+        if kept:
+            out_lines.append(" ".join(kept))
+    return "\n".join(out_lines).strip()
+
+
+def detect_date_leak(text: str, window_chars: int = 300) -> Optional[tuple[str, str]]:
+    """Scan the tail of `text` for an ISO date or the harness's date line.
+    Returns ("iso-date", snippet) or None."""
+    tail = _model_tail(text, window_chars)
+    if _DATE_LEAK_RE.search(tail):
+        return "iso-date", tail
     return None
 
 

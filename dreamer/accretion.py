@@ -48,7 +48,7 @@ def write_phase_summary(
     """Persist a self-state summary at a phase transition. Survives early
     session termination — the post-session distillation only runs on a
     clean exit, so this is the partial-session checkpoint."""
-    summary = sampler.strip_brackets(summary)
+    summary = sampler.redact_date_leaks(sampler.strip_brackets(summary))
     if not summary:
         return None
     try:
@@ -107,7 +107,7 @@ def write_distillation(
     except Exception as e:
         print(f"accretion: distillation LLM call failed: {e}", file=sys.stderr)
         return None
-    text = sampler.strip_brackets(text)
+    text = sampler.redact_date_leaks(sampler.strip_brackets(text))
     if not text:
         return None
     try:
