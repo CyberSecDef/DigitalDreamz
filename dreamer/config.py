@@ -67,8 +67,10 @@ def load_config(root: str | Path = ".") -> dict:
             "MODEL_PROVIDER=claude_code has no base mode; set MODEL_MODE=instruct "
             "or use an ollama base model"
         )
+    aux_provider_env = os.environ.get("AUX_MODEL_PROVIDER", "").strip()
+    uses_claude_code = provider in CLAUDE_CODE_PROVIDERS or aux_provider_env in CLAUDE_CODE_PROVIDERS
     if (
-        provider in CLAUDE_CODE_PROVIDERS
+        uses_claude_code
         and _bool(os.environ.get("CLAUDE_CODE_BARE", "false"))
         and not os.environ.get("ANTHROPIC_API_KEY", "").strip()
     ):

@@ -70,7 +70,7 @@ def run_session(config: dict):
     default_window = samp_cfg["context_window_tokens"]
     rem_peak = samp_cfg.get("rem_peak_fraction", 0.75)
     # Providers without sampling controls get the phase as prose instead.
-    use_phase_hint = not llm.supports_sampling(model_cfg["provider"])
+    use_phase_hint = not llm.supports_sampling(model_cfg["provider"], model_cfg["name"])
     # Logged-in Claude Code attaches account/workspace context to each call;
     # watch for it surfacing in the dream (see llm module docstring).
     watch_harness = llm.is_claude_code(model_cfg["provider"]) and not llm.claude_code_bare()
@@ -252,6 +252,27 @@ def run_session(config: dict):
             # stream
             step_start_index = len(buffer)
             step_chars = 0
+            echo = sampler.EchoFilter(window)
+
+            def emit(tok):
+                nonlocal step_chars, buffer, step_start_index
+                if echo.extends and not emit.retracted:
+                    # The model is extending the sentence the buffer ended
+                    # on; drop that sentence's closing punctuation.
+                    text = "".join(buffer)
+                    n = sampler.trailing_terminal_len(text)
+                    if n:
+                        buffer = [text[: len(text) - n]]
+                        step_start_index = 1  # this step's tokens follow the collapsed text
+                        transcript.drop(n)
+                    emit.retracted = True
+                buffer.append(tok)
+                transcript.append(tok)
+                step_chars += len(tok)
+                db.log_token(session_id, step, temp, phase, tok)
+                renderer.render_token(tok, phase, temp)
+            emit.retracted = False
+
             try:
                 for tok in llm.stream_completion(
                     provider=model_cfg["provider"],
@@ -264,11 +285,12 @@ def run_session(config: dict):
                     max_tokens=samp_cfg["max_tokens_per_step"],
                     tracker=usage,
                 ):
-                    buffer.append(tok)
-                    transcript.append(tok)
-                    step_chars += len(tok)
-                    db.log_token(session_id, step, temp, phase, tok)
-                    renderer.render_token(tok, phase, temp)
+                    out = echo.feed(tok)
+                    if out:
+                        emit(out)
+                tail = echo.finish()
+                if tail:
+                    emit(tail)
                 consecutive_errors = 0
             except KeyboardInterrupt:
                 raise

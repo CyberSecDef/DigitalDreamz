@@ -14,7 +14,8 @@ it into the dream; sampler.detect_harness_leak catches it for recovery.
 CLAUDE_CODE_BARE=true passes --bare, which removes that context entirely but
 authenticates only with ANTHROPIC_API_KEY.
 
-Every other provider routes through litellm, with two prompting modes:
+Every other provider routes through litellm (including the Anthropic API
+directly: MODEL_PROVIDER=anthropic), with two prompting modes:
 - 'instruct': chat-template path (system + user messages). For chat/instruct
   models. Uses litellm.completion.
 - 'base': raw text-completion path (no chat template, buffer sent as prefix).
@@ -173,9 +174,24 @@ def is_claude_code(provider: str) -> bool:
     return provider in CLAUDE_CODE_PROVIDERS
 
 
-def supports_sampling(provider: str) -> bool:
-    """False when the provider ignores temperature/top_p."""
-    return not is_claude_code(provider)
+_CLAUDE_MAJOR_RE = re.compile(r"claude-[a-z]+-(\d+)")
+
+
+def _is_claude(provider: str, name: str) -> bool:
+    return provider == "anthropic" or name.split("/")[-1].startswith("claude-")
+
+
+def supports_sampling(provider: str, name: str = "") -> bool:
+    """False when temperature can't be set: always under Claude Code (the CLI
+    has no flag), and for Claude 5-series models on the API, which reject
+    `temperature` outright ("deprecated for this model"). Haiku 4.5 and
+    Sonnet 4.5 still accept it (0–1)."""
+    if is_claude_code(provider):
+        return False
+    if _is_claude(provider, name):
+        m = _CLAUDE_MAJOR_RE.search(name)
+        return not (m and int(m.group(1)) >= 5)
+    return True
 
 
 # Seconds without any output before a Claude Code call is killed.
@@ -235,7 +251,7 @@ _SENTENCE_END_RE = re.compile(r"[.!?…](?:[\"'”’)*_]*)(?=\s|$)|\n")
 
 
 def _clip_at_budget(
-    text: str, emitted: int, budget: int, hard_cap: int
+    text: str, emitted: int, budget: int, hard_cap: int, prev_char: str = ""
 ) -> tuple[str, bool]:
     """Trim a delta against the step budget. Returns (text_to_emit, stop).
 
@@ -255,13 +271,19 @@ def _clip_at_budget(
         return (clipped if clipped.endswith("\n") else clipped + " "), True
     if end <= hard_cap:
         return text, False
-    room = text[: hard_cap - emitted]
+    # Hard cap: stop after the last whitespace so the step ends between
+    # words *with* the separator (dropping it glued "bark" + "the same bark").
+    limit = max(0, hard_cap - emitted)  # already past the cap after a long word
+    room = text[:limit]
     space = room.rfind(" ")
-    if space > 0:
-        return room[:space], True
-    # No whitespace in this delta before the cap; the previous delta ended
-    # on (or inside) a word already, so stop without adding a fragment.
-    return "", True
+    if space >= 0:
+        return room[: space + 1], True
+    if limit == 0 and (not prev_char or prev_char.isspace()):
+        return "", True  # already stopped between words
+    nxt = text.find(" ", limit)
+    if nxt != -1:
+        return text[: nxt + 1], True  # finish the word in progress
+    return text, False  # one long word; take it and look again next delta
 
 
 def parse_claude_code_event(line: str) -> tuple[Optional[str], Optional[dict]]:
@@ -350,7 +372,10 @@ def _stream_claude_code(
                 result = res
             if not text:
                 continue
-            text, cut = _clip_at_budget(text, emitted_chars, char_budget, hard_cap)
+            text, cut = _clip_at_budget(
+                text, emitted_chars, char_budget, hard_cap,
+                emitted[-1][-1:] if emitted else "",
+            )
             if text:
                 emitted.append(text)
                 emitted_chars += len(text)
@@ -413,9 +438,25 @@ def stream_completion(
         return
 
     model = _model_string(provider, name, mode)
-    sampling = {"temperature": temperature, "top_p": top_p}
-    if provider == "anthropic" or model.startswith("claude-"):
-        sampling = {"temperature": max(0.0, min(_ANTHROPIC_TEMP_MAX, temperature))}
+    extra: dict = {"temperature": temperature, "top_p": top_p}
+    if _is_claude(provider, name):
+        # Anthropic: temperature is 0–1 and can't be combined with top_p; the
+        # 5-series rejects it entirely. Thinking is on by default for those
+        # models and would spend the whole step budget before any text.
+        extra = {"thinking": {"type": "disabled"}}
+        if supports_sampling(provider, name):
+            extra["temperature"] = max(0.0, min(_ANTHROPIC_TEMP_MAX, temperature))
+
+    # Instruct models restart a sentence they were handed mid-word, so the
+    # step budget is soft: request up to the hard cap and stop client-side at
+    # the first sentence end past the budget (see _clip_at_budget). Base
+    # models continue mid-word happily and keep the server-side limit.
+    soft = mode != "base"
+    char_budget = max(1, max_tokens) * 4
+    hard_cap = int(char_budget * _SOFT_BUDGET_OVERRUN)
+    # Server-side headroom well past the client cap, so the client's
+    # sentence-end cut decides and the server never stops a step mid-word.
+    request_tokens = max_tokens * 2 + 16 if soft else max_tokens
 
     if mode == "base":
         # Base models have no chat template — concatenate any system framing
@@ -426,8 +467,8 @@ def stream_completion(
         response = litellm.text_completion(
             model=model,
             prompt=prompt,
-            **sampling,
-            max_tokens=max_tokens,
+            **extra,
+            max_tokens=request_tokens,
             stream=True,
             stream_options={"include_usage": True},
         )
@@ -439,24 +480,44 @@ def stream_completion(
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            **sampling,
-            max_tokens=max_tokens,
+            **extra,
+            max_tokens=request_tokens,
             stream=True,
             stream_options={"include_usage": True},
         )
         prompt_for_approx = f"{system_prompt}\n\n{user_prompt}"
 
     completion_buf: list[str] = []
+    emitted_chars = 0
     measured: Optional[tuple[int, int]] = None
 
     for chunk in response:
-        delta = _extract_delta(chunk)
-        if delta:
-            completion_buf.append(delta)
-            yield delta
         usage = _extract_usage(chunk)
         if usage is not None:
             measured = usage
+        delta = _extract_delta(chunk)
+        if not delta:
+            continue
+        cut = False
+        if soft:
+            delta, cut = _clip_at_budget(
+                delta, emitted_chars, char_budget, hard_cap,
+                completion_buf[-1][-1:] if completion_buf else "",
+            )
+        if delta:
+            completion_buf.append(delta)
+            emitted_chars += len(delta)
+            yield delta
+        if cut:
+            # Usage arrives on the final chunk, which a cut never reaches.
+            measured = None
+            close = getattr(response, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+            break
 
     if tracker is not None:
         if measured is not None:

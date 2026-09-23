@@ -212,6 +212,80 @@ def detect_register_drift(text: str, window_chars: int = 300) -> Optional[tuple[
     return None
 
 
+# ---------- step-start echo (instruct models repeating the last sentence) ----------
+
+_TERMINAL = ".!?…\"'”’"
+
+
+class EchoFilter:
+    """Hold back the start of a step while it matches the buffer's last
+    sentence. The buffer reaches instruct models as a user message (Claude
+    5-series refuses assistant prefill), and they sometimes open by echoing
+    the final sentence, then revise it:
+
+        …more like a weather. | The recipient's own name, … more like a weather — something
+
+    A full echo is dropped. If the model then extends the old sentence
+    rather than ending it, `extends` is set and the caller should remove the
+    buffer's final punctuation so the extension attaches to it. Sentences
+    under `min_len` chars are left alone, since short refrains are often
+    deliberate."""
+
+    def __init__(self, prev_text: str, min_len: int = 40):
+        tail = prev_text.rstrip()
+        last = ""
+        if tail and tail[-1] in _TERMINAL:
+            last = re.split(r"(?<=[.!?…])\s+", tail)[-1]
+        body = last.rstrip(_TERMINAL + " ")
+        ok = len(body) >= min_len and "‹" not in body and "›" not in body
+        self.body = body if ok else ""
+        self.terminal = last[len(body):].strip() if ok else ""
+        self.held = ""
+        self.passing = not self.body
+        self.extends = False
+        self.echoed = False
+
+    def feed(self, delta: str) -> str:
+        if self.passing:
+            return delta
+        self.held += delta
+        probe = self.held.lstrip()
+        if len(probe) <= len(self.body):
+            if self.body.startswith(probe):
+                return ""  # still matching; keep holding
+            return self._release()
+        if not probe.startswith(self.body):
+            return self._release()
+        rest = probe[len(self.body):]
+        self.passing = True
+        self.echoed = True
+        self.held = ""
+        if self.terminal and rest.startswith(self.terminal):
+            return rest[len(self.terminal):].lstrip()  # exact repeat: drop it
+        if rest[:1] in _TERMINAL:
+            return rest.lstrip(_TERMINAL).lstrip()  # repeat, different stop
+        self.extends = True  # "weather — something": continues the old sentence
+        return rest
+
+    def finish(self) -> str:
+        """Release anything still held when the stream ends."""
+        if self.passing or self.held.lstrip() == self.body:
+            self.held = ""
+            return ""
+        return self._release()
+
+    def _release(self) -> str:
+        out, self.held, self.passing = self.held, "", True
+        return out
+
+
+def trailing_terminal_len(text: str) -> int:
+    """Length of the trailing whitespace + sentence punctuation run."""
+    stripped = text.rstrip()
+    stripped = stripped.rstrip(_TERMINAL)
+    return len(text) - len(stripped)
+
+
 # ---------- clean-sentence truncation (used by recovery surgery) ----------
 
 # Sentence boundary characters appropriate to the dream register (drop ! and ?

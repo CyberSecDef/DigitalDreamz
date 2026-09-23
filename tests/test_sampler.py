@@ -141,3 +141,46 @@ def test_redact_date_leaks():
             "salt on the table")
     assert sampler.redact_date_leaks(text) == (
         "a room locked in regard. Windows face windows.\nsalt on the table")
+
+
+PREV = "The door has not chosen. The recipient's own name, in the unlearned hand, begins to seem less like a signature and more like a weather. "
+
+
+def _run_echo(prev, deltas):
+    f = sampler.EchoFilter(prev)
+    out = "".join(f.feed(d) for d in deltas) + f.finish()
+    return out, f
+
+
+def test_echo_then_extension_drops_repeat_and_flags_extends():
+    out, f = _run_echo(PREV, ["The recipient's own name, in the unlearned ", "hand, begins to seem less like a signature ",
+                              "and more like a weather — something that happens to a place."])
+    assert out == " — something that happens to a place."
+    assert f.extends and f.echoed
+
+
+def test_exact_echo_is_dropped():
+    out, f = _run_echo(PREV, ["The recipient's own name, in the unlearned hand, begins to seem less like a ",
+                              "signature and more like a weather. Rain arrives."])
+    assert out == "Rain arrives." and not f.extends
+
+
+def test_divergent_start_is_released_intact():
+    deltas = ["The recipient's own ", "coat hangs by the door."]
+    out, f = _run_echo(PREV, deltas)
+    assert out == "".join(deltas) and not f.echoed
+
+
+def test_short_refrain_is_not_treated_as_echo():
+    out, _ = _run_echo("Rooms. The house exhales. ", ["The house exhales. ", "Again."])
+    assert out == "The house exhales. Again."
+
+
+def test_stream_ending_mid_match_is_released():
+    out, _ = _run_echo(PREV, ["The recipient's own name"])
+    assert out == "The recipient's own name"
+
+
+def test_trailing_terminal_len():
+    assert sampler.trailing_terminal_len("a weather. ") == 2
+    assert sampler.trailing_terminal_len("a weather") == 0

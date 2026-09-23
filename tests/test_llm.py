@@ -59,11 +59,12 @@ def test_claude_code_runs_on_to_sentence_end(tmp_path, monkeypatch):
 
 
 def test_claude_code_hard_cap_cuts_at_word_boundary(tmp_path, monkeypatch):
-    # No sentence end before 1.5x budget (60 chars): stop at a word edge.
+    # No sentence end before 1.5x budget (60 chars): stop at a word edge,
+    # keeping the separator so the next step doesn't glue onto it.
     words = [_delta("drift ")] * 20
     monkeypatch.setenv("CLAUDE_CODE_BIN", _fake_claude(tmp_path, words, sleep=30))
     out = "".join(_stream(max_tokens=10))
-    assert out.strip() and len(out) <= 60
+    assert out.endswith(" ") and len(out) <= 60
     assert all(w == "drift" for w in out.split())
 
 
@@ -77,6 +78,19 @@ def test_claude_code_hard_cap_cuts_at_word_boundary(tmp_path, monkeypatch):
 ])
 def test_clip_at_budget(text, emitted, expected):
     assert llm._clip_at_budget(text, emitted, budget=10, hard_cap=30) == expected
+
+
+@pytest.mark.parametrize("text,emitted,expected", [
+    ("same bark the same", 25, ("same ", True)),          # hard cap: keep the space
+    ("ning then more", 32, ("ning ", True)),              # past cap mid-word: finish it
+    ("unbrokenwordcontinues", 32, ("unbrokenwordcontinues", False)),
+])
+def test_clip_at_hard_cap(text, emitted, expected):
+    assert llm._clip_at_budget(text, emitted, budget=10, hard_cap=30, prev_char="g") == expected
+
+
+def test_clip_at_hard_cap_after_word_boundary_adds_nothing():
+    assert llm._clip_at_budget("drift ", 30, budget=10, hard_cap=30, prev_char=" ") == ("", True)
 
 
 def test_claude_code_error_result_raises(tmp_path, monkeypatch):
@@ -115,7 +129,7 @@ def test_anthropic_via_litellm_clamps_temperature(monkeypatch):
         return iter(())
 
     monkeypatch.setattr(llm.litellm, "completion", fake_completion)
-    list(llm.stream_completion("anthropic", "claude-sonnet-5", "instruct", "s", "u", 1.7, 0.97, 10))
+    list(llm.stream_completion("anthropic", "claude-haiku-4-5-20251001", "instruct", "s", "u", 1.7, 0.97, 10))
     assert seen["temperature"] == 1.0 and "top_p" not in seen
 
 
@@ -124,3 +138,60 @@ def test_bare_swaps_safe_mode(monkeypatch):
     cmd = llm.claude_code_command("claude-sonnet-5", "SYS")
     assert "--bare" in cmd and "--safe-mode" not in cmd
     assert llm.claude_code_leak_terms() == ()
+
+
+class _Chunk:
+    def __init__(self, text=None, usage=None):
+        delta = type("D", (), {"content": text})()
+        self.choices = [type("C", (), {"delta": delta})()] if text is not None else []
+        self.usage = usage
+
+
+def _fake_litellm(monkeypatch, texts):
+    seen = {}
+
+    def fake_completion(**kwargs):
+        seen.update(kwargs)
+        return iter([_Chunk(t) for t in texts])
+
+    monkeypatch.setattr(llm.litellm, "completion", fake_completion)
+    return seen
+
+
+def test_anthropic_5_series_sends_no_temperature_and_no_thinking(monkeypatch):
+    seen = _fake_litellm(monkeypatch, ["Fog."])
+    list(llm.stream_completion("anthropic", "claude-sonnet-5", "instruct", "s", "u", 1.4, 0.97, 10))
+    assert "temperature" not in seen and "top_p" not in seen
+    assert seen["thinking"] == {"type": "disabled"}
+    assert seen["max_tokens"] == 36  # soft budget: server headroom past the client cap
+
+
+def test_litellm_instruct_stops_at_sentence_end(monkeypatch):
+    _fake_litellm(monkeypatch, ["The hallway outside ", "keeps forgetting to end. ", "It goes on."])
+    out = "".join(llm.stream_completion("openai", "gpt-4o-mini", "instruct", "s", "u", 1.0, 0.9, 10))
+    assert out == "The hallway outside keeps forgetting to end. "
+
+
+def test_litellm_base_mode_keeps_hard_server_limit(monkeypatch):
+    seen = {}
+
+    def fake_text_completion(**kwargs):
+        seen.update(kwargs)
+        return iter([_Chunk("keeps forge")])
+
+    monkeypatch.setattr(llm.litellm, "text_completion", fake_text_completion)
+    out = "".join(llm.stream_completion("ollama", "llama", "base", "", "u", 1.2, 0.9, 10))
+    assert out == "keeps forge" and seen["max_tokens"] == 10
+
+
+@pytest.mark.parametrize("provider,name,expected", [
+    ("claude_code", "claude-haiku-4-5-20251001", False),
+    ("anthropic", "claude-sonnet-5", False),
+    ("anthropic", "claude-opus-5-5", False),
+    ("anthropic", "claude-fable-5-1", False),
+    ("anthropic", "claude-haiku-4-5-20251001", True),
+    ("anthropic", "claude-sonnet-4-5", True),
+    ("ollama", "llama3", True),
+])
+def test_supports_sampling(provider, name, expected):
+    assert llm.supports_sampling(provider, name) is expected
