@@ -67,3 +67,17 @@ def test_bare_requires_api_key(root, monkeypatch):
         load_config(root)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
     assert load_config(root)["model"]["provider"] == "claude_code"
+
+
+def test_importing_litellm_does_not_load_dotenv(tmp_path):
+    # Regression: litellm's import-time load_dotenv() made .env values look
+    # like shell env, so they overrode the .env.<environment> overlay.
+    import subprocess, sys
+    (tmp_path / ".env").write_text("DREAMER_PROBE=from-dotenv\n")
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "import dreamer.llm, os; print(os.environ.get('DREAMER_PROBE'))"],
+        cwd=tmp_path, capture_output=True, text=True,
+        env={**__import__('os').environ, "PYTHONPATH": str(__import__('pathlib').Path(__file__).parents[1])},
+    )
+    assert out.stdout.strip() == "None", out.stderr

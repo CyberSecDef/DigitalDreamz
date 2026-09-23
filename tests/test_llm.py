@@ -70,7 +70,8 @@ def test_claude_code_crash_without_result_raises(tmp_path, monkeypatch):
         list(_stream())
 
 
-def test_claude_code_command_isolates_the_call():
+def test_claude_code_command_isolates_the_call(monkeypatch):
+    monkeypatch.delenv("CLAUDE_CODE_BARE", raising=False)
     cmd = llm.claude_code_command("claude-sonnet-5", "SYS")
     for flag in ("--safe-mode", "--strict-mcp-config", "--no-session-persistence"):
         assert flag in cmd
