@@ -6,7 +6,7 @@ Triggered on phase transitions only (cheap-ish; small extra LLM call per
 ~3-5 minutes of dream-time). Disabled by default — toggle with
 SELF_STATE_ENABLED=true.
 """
-from . import llm
+from . import llm, sampler
 
 
 SUMMARY_PROMPT = (
@@ -44,7 +44,7 @@ class SelfState:
         if not self.enabled:
             return self.summary
 
-        tail = recent_text[-2000:] if len(recent_text) > 2000 else recent_text
+        tail = sampler.strip_markers(recent_text[-4000:])[-2000:]
         if not tail.strip():
             return self.summary
 
@@ -56,7 +56,7 @@ class SelfState:
             text = llm.complete_once(
                 provider=self.model_cfg["provider"],
                 name=self.model_cfg["name"],
-                mode="instruct",
+                mode="instruct",  # model_cfg is the aux (instruct) model
                 system_prompt=SUMMARY_PROMPT,
                 user_prompt=tail,
                 temperature=0.6,
@@ -67,7 +67,7 @@ class SelfState:
         except Exception:
             return self.summary
 
-        text = text.strip()
+        text = sampler.strip_brackets(text)
         if len(text) > _MAX_SUMMARY_CHARS:
             text = text[:_MAX_SUMMARY_CHARS].rstrip() + "…"
         self.summary = text

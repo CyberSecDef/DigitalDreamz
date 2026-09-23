@@ -134,9 +134,6 @@ MODEL_MODE=base
 
 
 
-
-Here you go — formatted to drop into your existing TODO.md as a new section.
-
 ---
 
 # DigitalDreamz: Implementation TODO — Phase 2 (post base-model swap)

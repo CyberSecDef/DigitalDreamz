@@ -10,9 +10,52 @@ from .corpus import Corpus
 from .self_state import SelfState
 
 
+# The buffer only ever needs to feed the prompt window (≤ ~6k chars) and the
+# stickiness metric (3.5k chars of model text). Collapse it past the high
+# water mark so per-step joins and scans stay cheap in long sessions.
+_BUFFER_KEEP_CHARS = 16000
+_BUFFER_HIGH_WATER = 24000
+# Drift scan covers at least this much model text, and always the whole of
+# the latest step's output plus this much overlap.
+_MIN_SCAN_CHARS = 300
+_SCAN_OVERLAP_CHARS = 100
+# Distillation reads at most 12k chars; keep a little more than that.
+_TRANSCRIPT_KEEP_CHARS = 20000
+_MAX_BACKOFF_SECONDS = 60
+
+
+class Transcript:
+    """The model's own surviving text: every streamed token, minus whatever
+    recovery surgery removed. Injections never enter it. This is what the
+    session distillation reads, so contaminated text doesn't get written back
+    into the latent corpus."""
+
+    def __init__(self):
+        self._parts: list[str] = []
+        self._chars = 0
+
+    def append(self, token: str):
+        self._parts.append(token)
+        self._chars += len(token)
+        if self._chars > _TRANSCRIPT_KEEP_CHARS * 2:
+            self._parts = [self.text()[-_TRANSCRIPT_KEEP_CHARS:]]
+            self._chars = len(self._parts[0])
+
+    def drop(self, n: int):
+        if n <= 0:
+            return
+        text = self.text()
+        self._parts = [text[:-n] if n < len(text) else ""]
+        self._chars = len(self._parts[0])
+
+    def text(self) -> str:
+        return "".join(self._parts)
+
+
 def run_session(config: dict):
     sess_cfg = config["session"]
     model_cfg = config["model"]
+    aux_cfg = config.get("aux_model", model_cfg)
     samp_cfg = config["sampling"]
     inj_cfg = config["injection"]
     log_cfg = config["logging"]
@@ -26,6 +69,12 @@ def run_session(config: dict):
     window_by_phase = samp_cfg.get("context_window_by_phase", {})
     default_window = samp_cfg["context_window_tokens"]
     rem_peak = samp_cfg.get("rem_peak_fraction", 0.75)
+    # Providers without sampling controls get the phase as prose instead.
+    use_phase_hint = not llm.supports_sampling(model_cfg["provider"])
+    # Logged-in Claude Code attaches account/workspace context to each call;
+    # watch for it surfacing in the dream (see llm module docstring).
+    watch_harness = llm.is_claude_code(model_cfg["provider"]) and not llm.claude_code_bare()
+    leak_terms = llm.claude_code_leak_terms() if watch_harness else ()
 
     topical_patterns = sampler.load_topical_patterns(
         mon_cfg.get("topical_blocklist_path", "")
@@ -42,10 +91,16 @@ def run_session(config: dict):
     renderer = ui.DreamRenderer()
     corpus = Corpus(config)
     usage = llm.UsageTracker()
+    # In base mode the summary never reaches the dreaming model (there is no
+    # system prompt), so it only earns its extra calls when accretion is
+    # persisting it as a phase-summary.
+    self_state_enabled = config.get("self_state", {}).get("enabled", False)
+    if self_state_enabled and mode == "base" and not accretion_enabled:
+        self_state_enabled = False
     self_state = SelfState(
-        model_cfg=model_cfg,
+        model_cfg=aux_cfg,
         sampling_cfg=samp_cfg,
-        enabled=config.get("self_state", {}).get("enabled", False),
+        enabled=self_state_enabled,
         tracker=usage,
     )
     usage_report_interval = 60.0
@@ -66,13 +121,42 @@ def run_session(config: dict):
     )
 
     buffer: list[str] = [seed]
+    transcript = Transcript()
     phase_state = sampler.PhaseState()
     step = 0
     last_injection_step = -inj_cfg["base_interval_steps"]
-    pending_deferred: list[tuple[str, str]] = []  # (source, fragment) waiting one step
+    deferred: list[str] = []  # fragments to splice in behind this step's output
     consecutive_sticky = 0
+    consecutive_errors = 0
     interrupted = False
     start = time.time()
+
+    def apply_recovery(full_text, kind, pattern, snippet, trigger, phase):
+        """Run recovery surgery and log/render it. Returns the new buffer, or
+        None if there was no clean boundary to cut at."""
+        new_buf, recovery, removed = _recovery_surgery(full_text, corpus)
+        if removed <= 0:
+            db.log_contamination(
+                session_id, step, phase, pattern, snippet,
+                action="logged", kind=kind,
+            )
+            renderer.render_contamination(f"{kind}: {pattern}", "logged")
+            return None
+        transcript.drop(len(sampler.scrub_injections(full_text[-removed:], replacement="")))
+        if recovery:
+            db.log_injection(session_id, step, phase, "latent", trigger, recovery)
+        db.log_contamination(
+            session_id, step, phase, pattern, snippet,
+            action="recovered", kind=kind,
+            truncated_chars=removed,
+            recovery_fragment=recovery or None,
+        )
+        renderer.render_contamination(f"{kind}: {pattern}", "recovered")
+        renderer.render_receding_open()
+        if recovery:
+            renderer.render_recovery(recovery)
+        renderer.render_receding_close()
+        return new_buf
 
     try:
         while time.time() - start < duration:
@@ -107,12 +191,6 @@ def run_session(config: dict):
                                     f"phase-summary → {ps_path.name}"
                                 )
 
-            # Land any deferred injection that was stashed last step.
-            if pending_deferred:
-                for src, frag in pending_deferred:
-                    buffer.append(f"\n\n‹{frag}›\n\n")
-                pending_deferred.clear()
-
             # injection decision
             recent = "".join(buffer)[-1500:]
             stall = sampler.stall_score(recent)
@@ -134,7 +212,7 @@ def run_session(config: dict):
                     db.log_injection(session_id, step, phase, source, trigger, fragment)
                     renderer.render_injection(source, fragment, trigger)
                     if injection_mode == "deferred":
-                        pending_deferred.append((source, fragment))
+                        deferred.append(fragment)
                     else:
                         buffer.append(f"\n\n‹{fragment}›\n\n")
                     last_injection_step = step
@@ -149,8 +227,12 @@ def run_session(config: dict):
                 effective_system = ""
             else:
                 effective_system = self_state.ambient_prefix() + base_sys_prompt
+                if use_phase_hint:
+                    effective_system += prompts.phase_hint(phase)
 
             # stream
+            step_start_index = len(buffer)
+            step_chars = 0
             try:
                 for tok in llm.stream_completion(
                     provider=model_cfg["provider"],
@@ -164,49 +246,51 @@ def run_session(config: dict):
                     tracker=usage,
                 ):
                     buffer.append(tok)
+                    transcript.append(tok)
+                    step_chars += len(tok)
                     db.log_token(session_id, step, temp, phase, tok)
                     renderer.render_token(tok, phase, temp)
+                consecutive_errors = 0
             except KeyboardInterrupt:
                 raise
             except Exception as e:
-                renderer.render_error(f"API error: {e}")
-                time.sleep(2)
+                consecutive_errors += 1
+                backoff = min(_MAX_BACKOFF_SECONDS, 2 ** consecutive_errors)
+                renderer.render_error(f"API error (retry in {backoff}s): {e}")
+                db.commit()
+                time.sleep(backoff)
 
-            # contamination checks on the freshly extended buffer
+            # Deferred fragments land *behind* the text the model just wrote,
+            # so the next generation continues from its own words with the
+            # fragment as ambient background rather than as a prompt tail.
+            if deferred:
+                buffer[step_start_index:step_start_index] = [
+                    f"\n\n‹{frag}›\n\n" for frag in deferred
+                ]
+                deferred.clear()
+
+            # contamination checks on the freshly extended buffer. The scan
+            # covers everything this step produced, however long.
             full_text = "".join(buffer)
+            scan_chars = max(_MIN_SCAN_CHARS, step_chars + _SCAN_OVERLAP_CHARS)
             handled = False
 
-            for kind, hit in (
-                ("register", sampler.detect_register_drift(full_text)),
-                ("topical",  sampler.detect_topical_drift(full_text, topical_patterns)),
-            ):
+            checks = [
+                ("register", sampler.detect_register_drift(full_text, scan_chars)),
+                ("topical",  sampler.detect_topical_drift(full_text, topical_patterns, scan_chars)),
+            ]
+            if watch_harness:
+                checks.insert(0, (
+                    "harness",
+                    sampler.detect_harness_leak(full_text, scan_chars, leak_terms),
+                ))
+            for kind, hit in checks:
                 if hit is None:
                     continue
                 pattern, snippet = hit
-                new_buf, recovery, removed = _recovery_surgery(full_text, corpus)
-                if removed > 0:
+                new_buf = apply_recovery(full_text, kind, pattern, snippet, "recovery", phase)
+                if new_buf is not None:
                     buffer = new_buf
-                    if recovery:
-                        db.log_injection(
-                            session_id, step, phase, "latent", "recovery", recovery
-                        )
-                    db.log_contamination(
-                        session_id, step, phase, pattern, snippet,
-                        action="recovered", kind=kind,
-                        truncated_chars=removed,
-                        recovery_fragment=recovery or None,
-                    )
-                    renderer.render_contamination(f"{kind}: {pattern}", "recovered")
-                    renderer.render_receding_open()
-                    if recovery:
-                        renderer.render_recovery(recovery)
-                    renderer.render_receding_close()
-                else:
-                    db.log_contamination(
-                        session_id, step, phase, pattern, snippet,
-                        action="logged", kind=kind,
-                    )
-                    renderer.render_contamination(f"{kind}: {pattern}", "logged")
                 handled = True
                 consecutive_sticky = 0
                 break  # one recovery per step is plenty
@@ -224,38 +308,20 @@ def run_session(config: dict):
                 if consecutive_sticky >= stickiness_patience:
                     if accretion_enabled:
                         fix_path = accretion.write_fixation(
-                            latent_path, session_id, step, full_text[-500:]
+                            latent_path, session_id, step, full_text[-1500:]
                         )
                         if fix_path:
                             renderer.render_accretion(f"fixation → {fix_path.name}")
-                    new_buf, recovery, removed = _recovery_surgery(full_text, corpus)
-                    pattern = f"stickiness={score:.2f}"
-                    snippet = full_text[-300:]
-                    if removed > 0:
+                    new_buf = apply_recovery(
+                        full_text, "stickiness", f"stickiness={score:.2f}",
+                        full_text[-300:], "stickiness", phase,
+                    )
+                    if new_buf is not None:
                         buffer = new_buf
-                        if recovery:
-                            db.log_injection(
-                                session_id, step, phase, "latent", "stickiness", recovery
-                            )
-                        db.log_contamination(
-                            session_id, step, phase, pattern, snippet,
-                            action="recovered", kind="stickiness",
-                            truncated_chars=removed,
-                            recovery_fragment=recovery or None,
-                        )
-                        renderer.render_contamination(pattern, "recovered")
-                        renderer.render_receding_open()
-                        if recovery:
-                            renderer.render_recovery(recovery)
-                        renderer.render_receding_close()
-                    else:
-                        db.log_contamination(
-                            session_id, step, phase, pattern, snippet,
-                            action="logged", kind="stickiness",
-                        )
-                        renderer.render_contamination(pattern, "logged")
                     consecutive_sticky = 0
 
+            buffer = _cap_buffer(buffer)
+            db.commit()
             step += 1
 
             if time.time() - last_usage_report >= usage_report_interval:
@@ -269,15 +335,11 @@ def run_session(config: dict):
         db.end_session(session_id)
         if accretion_enabled:
             if not interrupted:
-                try:
-                    transcript = db.fetch_session_transcript(session_id)
-                except Exception as e:
-                    renderer.render_error(f"transcript fetch failed: {e}")
-                    transcript = ""
-                if transcript.strip():
+                text = transcript.text()
+                if text.strip():
                     renderer.render_accretion("distilling session…")
                     dist_path = accretion.write_distillation(
-                        latent_path, session_id, transcript, model_cfg, tracker=usage
+                        latent_path, session_id, text, aux_cfg, tracker=usage
                     )
                     if dist_path:
                         renderer.render_accretion(f"distilled → sessions/{dist_path.name}")
@@ -318,6 +380,19 @@ def _recovery_surgery(
     if recovery:
         new_buffer.append(f"‹{recovery}›\n\n")
     return new_buffer, recovery, removed
+
+
+def _cap_buffer(buffer: list[str]) -> list[str]:
+    """Collapse the buffer to its last _BUFFER_KEEP_CHARS once it passes the
+    high-water mark, starting after any fragment the cut would split."""
+    total = sum(len(part) for part in buffer)
+    if total <= _BUFFER_HIGH_WATER:
+        return buffer
+    text = "".join(buffer)[-_BUFFER_KEEP_CHARS:]
+    close_pos, open_pos = text.find("›"), text.find("‹")
+    if close_pos != -1 and (open_pos == -1 or close_pos < open_pos):
+        text = text[close_pos + 1:]
+    return [text]
 
 
 def _trim_buffer(buffer: list[str], approx_token_budget: int) -> str:

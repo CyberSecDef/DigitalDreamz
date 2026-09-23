@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS contamination_events (
     step INTEGER NOT NULL,
     ts REAL NOT NULL,
     phase TEXT NOT NULL,
-    kind TEXT NOT NULL DEFAULT 'register',   -- 'register' | 'topical' | 'stickiness'
+    kind TEXT NOT NULL DEFAULT 'register',   -- 'register' | 'topical' | 'stickiness' | 'harness'
     pattern TEXT NOT NULL,
     snippet TEXT NOT NULL,
     action TEXT NOT NULL,             -- 'logged' | 'recovered'
@@ -93,21 +93,31 @@ _MIGRATIONS = [
 
 
 class DB:
+    """Writes accumulate in an open transaction; the dream loop calls
+    commit() once per step. Autocommit meant one fsync per streamed token."""
+
     def __init__(self, path: str):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(path, isolation_level=None)
+        self.conn = sqlite3.connect(path)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.executescript(SCHEMA)
         for stmt in _MIGRATIONS:
             try:
                 self.conn.execute(stmt)
             except sqlite3.OperationalError:
                 pass
+        self.conn.commit()
+
+    def commit(self):
+        self.conn.commit()
 
     def start_session(self, model: str, perspective: str, config: dict) -> int:
         cur = self.conn.execute(
             "INSERT INTO sessions (started_at, model, perspective, config_json) VALUES (?, ?, ?, ?)",
             (time.time(), model, perspective, json.dumps(config)),
         )
+        self.conn.commit()
         return cur.lastrowid
 
     def end_session(self, session_id: int):
@@ -115,6 +125,7 @@ class DB:
             "UPDATE sessions SET ended_at = ? WHERE id = ?",
             (time.time(), session_id),
         )
+        self.conn.commit()
 
     def log_token(self, session_id, step, temp, phase, token):
         self.conn.execute(
@@ -168,12 +179,6 @@ class DB:
             (session_id, step, time.time(), phase, summary),
         )
 
-    def fetch_session_transcript(self, session_id: int) -> str:
-        cur = self.conn.execute(
-            "SELECT token FROM tokens WHERE session_id = ? ORDER BY step, id",
-            (session_id,),
-        )
-        return "".join(row[0] for row in cur)
-
     def close(self):
+        self.conn.commit()
         self.conn.close()

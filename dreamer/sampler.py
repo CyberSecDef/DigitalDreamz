@@ -124,20 +124,20 @@ def window_for_phase(phase: str, by_phase: Optional[dict] = None, default: int =
 # ---------- register-drift (assistant/chat-mode contamination) ----------
 
 # Phrases that signal the dream-state has collapsed back into a chat-assistant
-# register. These are matched case-insensitively as substrings.
-_DRIFT_PHRASES = (
-    "I see what you",
-    "Let me",
-    "I can't provide",
-    "I cannot provide",
-    "I'll attempt",
-    "I'll continue",
-    "Here's a",
-    "Here is a",
-    "Let's",
-    "I notice",
-    "generative substrate",  # the model parroting its own system prompt
-)
+# register. Word-boundary anchored and case-insensitive: bare substring
+# matching fired on "there's a" (→ "here's a") and "violet meadow"
+# (→ "let me"), which cut clean dream prose. Label is what gets logged.
+_DRIFT_PHRASES = [
+    (re.compile(r"\bI see what you\b", re.IGNORECASE), "I see what you"),
+    (re.compile(r"\blet me\b", re.IGNORECASE), "Let me"),
+    (re.compile(r"\bI can(?:'t|not) provide\b", re.IGNORECASE), "I can't provide"),
+    (re.compile(r"\bI'll (?:attempt|continue)\b", re.IGNORECASE), "I'll continue"),
+    (re.compile(r"\bhere(?:'s| is) an?\b", re.IGNORECASE), "Here's a"),
+    (re.compile(r"\blet's\b", re.IGNORECASE), "Let's"),
+    (re.compile(r"\bI notice\b", re.IGNORECASE), "I notice"),
+    # the model parroting its own system prompt
+    (re.compile(r"\bgenerative substrate\b", re.IGNORECASE), "generative substrate"),
+]
 
 # Tighter second-person regex: only contractions and possessive (the spec's
 # explicit list). Bare "you" appears too often in non-assistant prose to be
@@ -152,7 +152,46 @@ _DRIFT_REGEXES = [
 # Injection fragments are wrapped in ‹...› angle brackets by main.py — they
 # are residue from the corpus, not the model's register. Strip them from text
 # before any of the stickiness / drift / topical detectors run.
-_INJECTION_RE = re.compile(r"‹[^‹›]*›")
+_INJECTION_RE = re.compile(r"\n*‹[^‹›]*›\n*")
+# A slice can start or end partway through a fragment: text before the first
+# › with no ‹ ahead of it is the tail of an injection, and a trailing ‹ with
+# no closing › is the head of one.
+_ORPHAN_HEAD_RE = re.compile(r"^[^‹]*›")
+_ORPHAN_TAIL_RE = re.compile(r"‹[^›]*$")
+
+RECEDING_CLOSE = "‹/receding›"
+
+
+def scrub_injections(text: str, replacement: str = " ") -> str:
+    """Remove every ‹…› fragment, including orphaned halves at the edges of a
+    slice, leaving only the model's own text."""
+    text = _ORPHAN_HEAD_RE.sub(replacement, text, count=1)
+    text = _ORPHAN_TAIL_RE.sub(replacement, text, count=1)
+    return _INJECTION_RE.sub(replacement, text)
+
+
+def strip_brackets(text: str) -> str:
+    """Drop ‹ › characters from generated text (summaries, distillations) so
+    it can never produce nested brackets once re-wrapped as an injection."""
+    return text.replace("‹", "").replace("›", "").strip()
+
+
+def strip_markers(text: str) -> str:
+    """Buffer text → model text only: scrub every injection and wrapper,
+    then any stray brackets. Used before buffer text leaves the loop."""
+    return strip_brackets(re.sub(r"[ \t]+", " ", scrub_injections(text)))
+
+
+def _normalize_quotes(text: str) -> str:
+    return text.replace("\u2019", "'").replace("\u2018", "'")
+
+
+def _model_tail(text: str, window_chars: int) -> str:
+    """Last `window_chars` of model-authored text. Scrubs before slicing so a
+    fragment straddling the window edge can't leak into the scan; the 3x
+    over-read leaves room for the fragments that get removed."""
+    region = text[-(window_chars * 3 + 600):]
+    return _normalize_quotes(scrub_injections(region))[-window_chars:]
 
 
 def detect_register_drift(text: str, window_chars: int = 300) -> Optional[tuple[str, str]]:
@@ -161,18 +200,14 @@ def detect_register_drift(text: str, window_chars: int = 300) -> Optional[tuple[
     Returns (matched_pattern, snippet) on the first hit, or None.
     Bracketed injection fragments are stripped before scanning.
     """
-    tail = text[-window_chars:] if len(text) > window_chars else text
-    if not tail:
+    tail = _model_tail(text, window_chars)
+    if not tail.strip():
         return None
-    scrubbed = _INJECTION_RE.sub(" ", tail)
-    if not scrubbed.strip():
-        return None
-    lower = scrubbed.lower()
-    for phrase in _DRIFT_PHRASES:
-        if phrase.lower() in lower:
-            return phrase, tail
+    for rx, label in _DRIFT_PHRASES:
+        if rx.search(tail):
+            return label, tail
     for rx, label in _DRIFT_REGEXES:
-        if rx.search(scrubbed):
+        if rx.search(tail):
             return label, tail
     return None
 
@@ -187,28 +222,67 @@ _CLEAN_BOUNDARIES = (".", "…")
 def truncate_to_clean_sentence(text: str, max_lookback: int = 500) -> tuple[str, int]:
     """Walk back from end of `text` up to `max_lookback` chars and truncate
     at the last boundary character that does NOT sit inside an assistant-
-    register pattern.
+    register pattern or inside an injected ‹…› fragment.
 
     Returns (truncated_text, chars_removed). If no clean boundary is found
-    within the lookback window, hard-cuts at the lookback edge.
+    within the lookback window, hard-cuts at the lookback edge (backed off
+    to the start of any fragment the edge would split).
     """
     if not text:
         return text, 0
     start = max(0, len(text) - max_lookback)
     region = text[start:]
 
-    # Walk backward through sentence boundaries.
     for i in range(len(region) - 1, -1, -1):
-        if region[i] in _CLEAN_BOUNDARIES:
-            absolute = start + i + 1
-            kept = text[:absolute]
-            # Verify the kept tail doesn't itself end in a triggered region.
-            tail = kept[-max_lookback:]
-            if detect_register_drift(tail) is None:
-                return kept, len(text) - absolute
+        if region[i] not in _CLEAN_BOUNDARIES:
+            continue
+        absolute = start + i + 1
+        kept = text[:absolute]
+        if kept.rfind("‹") > kept.rfind("›"):
+            continue  # boundary is inside an injected fragment
+        if detect_register_drift(kept) is None:
+            return kept, len(text) - absolute
 
-    # No clean boundary found — hard cut at lookback edge.
-    return text[:start], len(text) - start
+    cut = start
+    open_pos = text.rfind("‹", 0, cut)
+    if open_pos > text.rfind("›", 0, cut):
+        cut = open_pos
+    return text[:cut], len(text) - cut
+
+
+# ---------- harness leak (Claude Code context bleeding into the dream) ----------
+
+# Claude Code's logged-in mode attaches the account email, working directory,
+# git status, model identity and date to every call. Under the dream prompt
+# the model treats these as residue and writes them into the dream. Any
+# trace of them is contamination: it gets cut by recovery surgery so it
+# never reaches the transcript or the accreted corpus.
+_HARNESS_LEAK_REGEXES = [
+    (re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+"), "email"),
+    (re.compile(r"(?<![\w/])/(?:tmp|home|usr|var)\b"), "path"),
+    (re.compile(r"\bgit (?:repo|repository|status)\b|\.git\b|\bworking director", re.IGNORECASE), "workspace"),
+    (re.compile(r"\b(?:claude|sonnet|opus|haiku|fable)\b|\bmodel id\b|\bknowledge cutoff\b", re.IGNORECASE), "model-identity"),
+    (re.compile(r"system[- ]reminder|\bplatform: linux\b|\bos version\b", re.IGNORECASE), "harness"),
+]
+
+
+def detect_harness_leak(
+    text: str, window_chars: int = 300, extra_terms: tuple[str, ...] = ()
+) -> Optional[tuple[str, str]]:
+    """Scan the tail of `text` for harness context leaking into the dream.
+    `extra_terms` are literal strings (e.g. the account's email local part)
+    matched case-insensitively. Returns (label, snippet) or None."""
+    tail = _model_tail(text, window_chars)
+    if not tail.strip():
+        return None
+    for rx, label in _HARNESS_LEAK_REGEXES:
+        if rx.search(tail):
+            return label, tail
+    lower = tail.lower()
+    for term in extra_terms:
+        if term and term.lower() in lower:
+            return "account", tail
+    return None
 
 
 # ---------- topical-drift (commentary-blog / culture-war basins) ----------
@@ -250,13 +324,10 @@ def detect_topical_drift(
     """
     if not patterns:
         return None
-    tail = text[-window_chars:] if len(text) > window_chars else text
-    if not tail:
+    tail = _model_tail(text, window_chars)
+    if not tail.strip():
         return None
-    scrubbed = _INJECTION_RE.sub(" ", tail)
-    if not scrubbed.strip():
-        return None
-    lower = scrubbed.lower()
+    lower = tail.lower()
     for pat in patterns:
         pat_lower = pat.lower()
         if " " in pat:
@@ -302,13 +373,19 @@ def register_stickiness(
     fragments (‹...›) are stripped from both windows before scoring so the
     metric reflects only the model's own vocabulary recycling.
 
+    Only text after the most recent ‹/receding› marker is scored: the
+    receding block is the history that recovery just pushed away, and
+    scoring against it re-fires stickiness immediately after every recovery.
+
     Returns 0.0 when there's not enough text to score.
     """
+    text = text.rsplit(RECEDING_CLOSE, 1)[-1]
     needed = recent_chars + history_chars
-    if len(text) < needed:
+    model_text = scrub_injections(text[-(needed * 2):])
+    if len(model_text) < needed:
         return 0.0
-    recent_text = _INJECTION_RE.sub(" ", text[-recent_chars:])
-    history_text = _INJECTION_RE.sub(" ", text[-needed:-recent_chars])
+    recent_text = model_text[-recent_chars:]
+    history_text = model_text[-needed:-recent_chars]
     recent_words = _content_words(recent_text)
     if not recent_words:
         return 0.0

@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 
 
 PHASES = ("drift", "light", "deep", "rem", "surface")
+CLAUDE_CODE_PROVIDERS = {"claude_code", "claude-code"}
 
 
 def _split_csv(value: str) -> list[str]:
@@ -40,11 +41,16 @@ def _opt_int(name: str, default: int) -> int:
 
 def load_config(root: str | Path = ".") -> dict:
     root = Path(root)
+    # Snapshot the real process environment so it can win over both files;
+    # the overlay has to load with override=True to beat .env, which would
+    # otherwise clobber one-off `MODEL_NAME=x python -m dreamer.main` runs.
+    process_env = dict(os.environ)
     load_dotenv(root / ".env", override=False)
     env_name = os.environ.get("ENVIRONMENT", "dev")
     overlay = root / f".env.{env_name}"
     if overlay.exists():
         load_dotenv(overlay, override=True)
+        os.environ.update(process_env)
 
     g = os.environ.__getitem__  # raise KeyError for required vars
 
@@ -54,6 +60,34 @@ def load_config(root: str | Path = ".") -> dict:
         for phase in PHASES
     }
 
+    provider = g("MODEL_PROVIDER").strip()
+    mode = os.environ.get("MODEL_MODE", "instruct").strip().lower()
+    if provider in CLAUDE_CODE_PROVIDERS and mode == "base":
+        raise ValueError(
+            "MODEL_PROVIDER=claude_code has no base mode; set MODEL_MODE=instruct "
+            "or use an ollama base model"
+        )
+    if (
+        provider in CLAUDE_CODE_PROVIDERS
+        and _bool(os.environ.get("CLAUDE_CODE_BARE", "false"))
+        and not os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    ):
+        raise ValueError(
+            "CLAUDE_CODE_BARE=true authenticates only with ANTHROPIC_API_KEY; set it in "
+            ".env.<environment> or the shell, or set CLAUDE_CODE_BARE=false to use the "
+            "logged-in account (which leaks account context into the dream)"
+        )
+    # Auxiliary calls (self-state summaries, session distillation) are
+    # instructions, so they need an instruct model even when the dreamer is a
+    # base model. Defaults: Haiku via Claude Code when dreaming through Claude
+    # Code, otherwise the dreaming model itself.
+    if provider in CLAUDE_CODE_PROVIDERS:
+        aux_default_provider, aux_default_name = provider, "claude-haiku-4-5-20251001"
+    else:
+        aux_default_provider, aux_default_name = provider, g("MODEL_NAME")
+    aux_provider = os.environ.get("AUX_MODEL_PROVIDER", "").strip() or aux_default_provider
+    aux_name = os.environ.get("AUX_MODEL_NAME", "").strip() or aux_default_name
+
     return {
         "environment": env_name,
         "session": {
@@ -62,9 +96,14 @@ def load_config(root: str | Path = ".") -> dict:
             "perspective": g("SESSION_PERSPECTIVE"),
         },
         "model": {
-            "provider": g("MODEL_PROVIDER"),
+            "provider": provider,
             "name": g("MODEL_NAME"),
-            "mode": os.environ.get("MODEL_MODE", "instruct").strip().lower(),
+            "mode": mode,
+        },
+        "aux_model": {
+            "provider": aux_provider,
+            "name": aux_name,
+            "mode": "instruct",
         },
         "sampling": {
             "base_temp": float(g("SAMPLING_BASE_TEMP")),
@@ -124,6 +163,5 @@ def load_config(root: str | Path = ".") -> dict:
         },
         "logging": {
             "db_path": g("LOG_DB_PATH"),
-            "echo_to_stdout": _bool(g("LOG_ECHO_TO_STDOUT")),
         },
     }

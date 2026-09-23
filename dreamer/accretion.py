@@ -1,10 +1,14 @@
-"""Latent corpus self-extension. Three tiers, all under the latent path:
+"""Latent corpus self-extension. Four tiers, all under the latent path:
 
-    fixations/   — online captures of the buffer when stickiness fires
-    sessions/    — post-session distillations via a single complete_once call
-    preserved/   — manual, hand-curated material (no auto-write)
+    fixations/        — online captures of the buffer when stickiness fires
+    phase-summaries/  — self-state summaries persisted at phase transitions
+    sessions/         — post-session distillations via a single complete_once call
+    preserved/        — manual, hand-curated material (no auto-write)
 
-All three are picked up automatically by LatentCorpus on the next session.
+All are picked up automatically by LatentCorpus on the next session, subject
+to the weights in corpus/latent/weights.txt. Everything written here passes
+through sampler.strip_markers / strip_brackets first: ‹…› residue in a corpus file would nest
+inside the ‹…› wrapper once the file is sampled back as an injection.
 Weighting is governed by corpus/latent/weights.txt; default rules are
 shipped there. Failures here are non-fatal — accretion never blocks the
 dream loop.
@@ -15,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from . import llm
+from . import llm, sampler
 
 
 DISTILL_PROMPT = (
@@ -44,7 +48,7 @@ def write_phase_summary(
     """Persist a self-state summary at a phase transition. Survives early
     session termination — the post-session distillation only runs on a
     clean exit, so this is the partial-session checkpoint."""
-    summary = summary.strip()
+    summary = sampler.strip_brackets(summary)
     if not summary:
         return None
     try:
@@ -61,7 +65,7 @@ def write_fixation(latent_path: str, session_id: int, step: int, snippet: str) -
     """Tier A: capture the recent buffer when stickiness recovery fires.
     Filename carries metadata; file content is plain fragment so the
     chunk sampler doesn't pollute future injections with frontmatter."""
-    snippet = snippet.strip()
+    snippet = sampler.strip_markers(snippet)[-500:].lstrip()
     if not snippet:
         return None
     try:
@@ -82,7 +86,9 @@ def write_distillation(
     tracker=None,
 ) -> Optional[Path]:
     """Tier B: one-shot summary of the session transcript, written to
-    sessions/. Returns the path written, or None on failure / empty input."""
+    sessions/. `transcript` should be the model's surviving text only (no
+    injections, nothing recovery surgery removed). `model_cfg` is the aux
+    model. Returns the path written, or None on failure / empty input."""
     if not transcript.strip():
         return None
     tail = transcript[-_MAX_DISTILL_INPUT_CHARS:]
@@ -101,7 +107,7 @@ def write_distillation(
     except Exception as e:
         print(f"accretion: distillation LLM call failed: {e}", file=sys.stderr)
         return None
-    text = text.strip()
+    text = sampler.strip_brackets(text)
     if not text:
         return None
     try:

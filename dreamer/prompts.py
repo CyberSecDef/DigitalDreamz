@@ -116,12 +116,21 @@ def system_prompt(perspective: str) -> str:
     return THIRD_PERSON if perspective == "third" else NO_PERSON
 
 
-def initial_seed(perspective: str, index: int = 0) -> str:
-    """Return one seed. `index` is hashed across the pool length so callers
-    can keep using `int(time.time()) % 3` without truncating to the original
-    three-seed pool."""
-    seeds = SEEDS_THIRD if perspective == "third" else SEEDS_NONE
-    return seeds[index % len(seeds)]
+# Stand-in for the temperature curve on providers with no sampling controls
+# (Claude Code). The phase arc still shapes window size and injection mix;
+# this carries the loosening/tightening the temperature would have.
+PHASE_HINTS = {
+    "drift":   "Settling. Images arrive slowly and connect loosely.",
+    "light":   "Loose association. A scene holds for a moment, then shifts.",
+    "deep":    "Sinking. Logic thins. Things fuse and become each other.",
+    "rem":     "Vivid and unstable. Transformations mid-sentence. Nothing owes continuity.",
+    "surface": "Rising. Images slow and settle. Edges begin to return.",
+}
+
+
+def phase_hint(phase: str) -> str:
+    hint = PHASE_HINTS.get(phase)
+    return f"\n\nCurrent depth: {hint}" if hint else ""
 
 
 def random_seed(perspective: str) -> str:

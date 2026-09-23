@@ -4,21 +4,28 @@ day_residue   — today's conversation transcripts; pulls salient fragments
 world_events  — RSS headlines + first paragraphs
 latent        — slow substrate; random chunks from a directory
 """
+import fnmatch
 import re
 import random
+import threading
 import time
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
 import feedparser
 
 
+def _clean_fragment(text: str) -> str:
+    """Drop ‹ › so a fragment can't nest inside the ‹…› wrapper main.py adds
+    (nested brackets defeat the injection scrubber)."""
+    return text.replace("‹", "").replace("›", "").strip()
+
+
 # ---------- DAY RESIDUE ----------
 
-# crude salience: questions, exclamations, sentences with rare-ish words,
-# sentences with named entities (rough heuristic — Capitalized mid-sentence words).
-_QUESTION = re.compile(r"[^.!?]*\?")
-_EXCLAIM = re.compile(r"[^.!?]*!")
+# crude salience: questions, exclamations, sentences with named entities
+# (rough heuristic — Capitalized mid-sentence words).
 _SENT = re.compile(r"[^.!?\n]+[.!?]")
 
 
@@ -60,7 +67,7 @@ class DayResidue:
     def sample(self) -> Optional[str]:
         if not self.fragments:
             return None
-        return random.choice(self.fragments)
+        return _clean_fragment(random.choice(self.fragments))
 
 
 # ---------- WORLD EVENTS ----------
@@ -108,6 +115,7 @@ def _sanitize_world_fragment(text: str) -> str:
 
 class WorldEvents:
     REFRESH_SECONDS = 1800  # 30 min
+    FETCH_TIMEOUT = 10      # per feed; feedparser alone never times out
 
     def __init__(
         self,
@@ -122,7 +130,11 @@ class WorldEvents:
         self.sanitize = sanitize
         self.fragments: list[str] = []
         self._last_fetch = 0.0
+        self._refreshing = threading.Lock()
         self._word_re = re.compile(r"[A-Za-z']+")
+        # First fetch is synchronous (bounded by FETCH_TIMEOUT per feed) so
+        # the session starts with world material; later refreshes run in the
+        # background so the dream loop never blocks on the network.
         self._refresh()
 
     def _is_blocked(self, text: str) -> bool:
@@ -134,14 +146,24 @@ class WorldEvents:
     def _maybe_sanitize(self, text: str) -> str:
         return _sanitize_world_fragment(text) if self.sanitize else text
 
+    def _fetch(self, url: str):
+        req = urllib.request.Request(url, headers={"User-Agent": "dreamer/1.0"})
+        with urllib.request.urlopen(req, timeout=self.FETCH_TIMEOUT) as resp:
+            return feedparser.parse(resp.read())
+
     def _refresh(self):
-        now = time.time()
-        if now - self._last_fetch < self.REFRESH_SECONDS and self.fragments:
+        if not self._refreshing.acquire(blocking=False):
             return
-        new_frags = []
-        for url in self.feeds:
-            try:
-                d = feedparser.parse(url)
+        try:
+            # Stamp the attempt up front: a failed refresh waits the full
+            # interval instead of retrying on every sample.
+            self._last_fetch = time.time()
+            new_frags = []
+            for url in self.feeds:
+                try:
+                    d = self._fetch(url)
+                except Exception:
+                    continue
                 for entry in d.entries[:25]:
                     title = self._maybe_sanitize(
                         (entry.get("title") or "").strip()
@@ -155,17 +177,21 @@ class WorldEvents:
                         first = re.split(r"(?<=[.!?])\s", summary)[0]
                         if not self._is_blocked(first):
                             new_frags.append(first)
-            except Exception:
-                continue
-        if new_frags:
-            self.fragments = new_frags
-            self._last_fetch = now
+            if new_frags:
+                self.fragments = new_frags
+        finally:
+            self._refreshing.release()
+
+    def _maybe_refresh_async(self):
+        if time.time() - self._last_fetch < self.REFRESH_SECONDS:
+            return
+        threading.Thread(target=self._refresh, daemon=True).start()
 
     def sample(self) -> Optional[str]:
-        self._refresh()
+        self._maybe_refresh_async()
         if not self.fragments:
             return None
-        return random.choice(self.fragments)
+        return _clean_fragment(random.choice(self.fragments))
 
 
 # ---------- LATENT SUBSTRATE ----------
@@ -187,7 +213,9 @@ class LatentCorpus:
     def __init__(self, path: str, chunk_chars: int = 280):
         self.path = Path(path)
         self.chunk_chars = chunk_chars
-        self.texts: list[str] = []
+        # One entry per file: the file's paragraphs (or lines, for one-
+        # fragment-per-line files such as session distillations).
+        self.texts: list[list[str]] = []
         self.weights: list[float] = []
         self._load()
 
@@ -205,13 +233,30 @@ class LatentCorpus:
                 w = self._weight_for(rel, weight_rules)
                 if w <= 0:
                     continue
-                self.texts.append(content)
+                units = self._units(content)
+                if not units:
+                    continue
+                self.texts.append(units)
                 self.weights.append(w)
+
+    def _units(self, content: str) -> list[str]:
+        """Split a file into self-contained sampling units. Paragraphs split
+        on blank lines; an oversized paragraph made of several lines is split
+        on lines instead, so list-shaped files yield one fragment per line."""
+        units: list[str] = []
+        for para in re.split(r"\n\s*\n", content):
+            para = para.strip()
+            if not para:
+                continue
+            if len(para) > self.chunk_chars and "\n" in para:
+                units.extend(l.strip() for l in para.splitlines() if l.strip())
+            else:
+                units.append(" ".join(para.split()))
+        return units
 
     def _collect_weight_rules(self) -> list[tuple[str, float]]:
         """Read every weights.txt file under the latent path. Rules from
         deeper files override shallower ones for matches under that subtree."""
-        import fnmatch  # noqa: F401  (used implicitly via _weight_for)
         rules: list[tuple[str, float]] = []
         for wf in sorted(self.path.glob("**/weights.txt")):
             base = wf.parent.relative_to(self.path).as_posix()
@@ -245,27 +290,33 @@ class LatentCorpus:
         return rules
 
     def _weight_for(self, rel_path: str, rules: list[tuple[str, float]]) -> float:
-        import fnmatch
         for pattern, weight in rules:
             if fnmatch.fnmatchcase(rel_path, pattern):
                 return weight
         return 1.0
 
     def sample(self) -> Optional[str]:
+        """Pick a file by weight, then a paragraph. Paragraphs within the
+        chunk budget are returned whole; longer ones yield a run of whole
+        sentences starting at a random sentence, so a fragment never opens
+        or closes mid-sentence."""
         if not self.texts:
             return None
-        text = random.choices(self.texts, weights=self.weights, k=1)[0]
-        if len(text) <= self.chunk_chars:
-            return text.strip()
-        start = random.randint(0, len(text) - self.chunk_chars)
-        # try to start at a word boundary
-        chunk = text[start:start + self.chunk_chars]
-        # snap to whitespace edges
-        first_space = chunk.find(" ")
-        last_space = chunk.rfind(" ")
-        if first_space > 0 and last_space > first_space:
-            chunk = chunk[first_space:last_space]
-        return chunk.strip()
+        units = random.choices(self.texts, weights=self.weights, k=1)[0]
+        unit = random.choice(units)
+        if len(unit) <= self.chunk_chars:
+            return _clean_fragment(unit)
+        sentences = re.split(r"(?<=[.!?…])\s+", unit)
+        i = random.randrange(len(sentences))
+        chunk = sentences[i]
+        for nxt in sentences[i + 1:]:
+            if len(chunk) + 1 + len(nxt) > self.chunk_chars:
+                break
+            chunk = f"{chunk} {nxt}"
+        if len(chunk) > self.chunk_chars:
+            # a single sentence longer than the budget: cut at a word edge
+            chunk = chunk[: self.chunk_chars].rsplit(" ", 1)[0] + "…"
+        return _clean_fragment(chunk)
 
 
 # ---------- COMPOSITE ----------

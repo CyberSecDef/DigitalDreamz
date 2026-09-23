@@ -1,15 +1,39 @@
-"""Multi-provider streaming via litellm.
+"""Multi-provider streaming: Claude Code (default) or litellm.
 
-Two prompting modes:
+Provider `claude_code` shells out to the `claude` CLI in print mode. Each
+call is stripped down: --safe-mode (no hooks, CLAUDE.md, plugins, MCP), no
+tools, no thinking, no session persistence, and our own system prompt in
+place of Claude Code's. The CLI exposes no sampling controls, so temperature
+and top_p are ignored on this path and max_tokens is enforced client-side by
+cutting the stream (see prompts.phase_hint for the substitute).
+
+Logged-in (subscription) auth still attaches context the flags can't remove:
+the account email, working directory, git status, model identity, and date.
+The dream prompt reads anything unexplained as residue, so the model weaves
+it into the dream; sampler.detect_harness_leak catches it for recovery.
+CLAUDE_CODE_BARE=true passes --bare, which removes that context entirely but
+authenticates only with ANTHROPIC_API_KEY.
+
+Every other provider routes through litellm, with two prompting modes:
 - 'instruct': chat-template path (system + user messages). For chat/instruct
   models. Uses litellm.completion.
 - 'base': raw text-completion path (no chat template, buffer sent as prefix).
   For non-chat-tuned base models. Uses litellm.text_completion. For Ollama,
   this routes through /api/generate rather than /api/chat.
 """
+import json
 import os
+import subprocess
+import tempfile
+import threading
 from typing import Iterator, Optional
 import litellm
+
+from .config import CLAUDE_CODE_PROVIDERS
+
+# Providers that accept temperature/top_p. Anthropic's API caps temperature
+# at 1.0 and recent Claude models reject temperature and top_p together.
+_ANTHROPIC_TEMP_MAX = 1.0
 
 if os.environ.get("LITELLM_DEBUG", "").lower() in {"1", "true", "yes"}:
     litellm._turn_on_debug()
@@ -32,12 +56,20 @@ class UsageTracker:
         self.cost_delta = 0.0
         self.had_approx = False  # true if any window contained estimated counts
 
-    def add(self, prompt_tokens: int, completion_tokens: int, model: str, approx: bool = False) -> None:
+    def add(
+        self,
+        prompt_tokens: int,
+        completion_tokens: int,
+        model: str,
+        approx: bool = False,
+        cost: Optional[float] = None,
+    ) -> None:
         self.prompt_total += prompt_tokens
         self.completion_total += completion_tokens
         self.prompt_delta += prompt_tokens
         self.completion_delta += completion_tokens
-        cost = _estimate_cost(model, prompt_tokens, completion_tokens)
+        if cost is None:
+            cost = _estimate_cost(model, prompt_tokens, completion_tokens)
         self.cost_total += cost
         self.cost_delta += cost
         if approx:
@@ -136,6 +168,191 @@ def _extract_usage(chunk) -> Optional[tuple[int, int]]:
     return int(p or 0), int(c or 0)
 
 
+def is_claude_code(provider: str) -> bool:
+    return provider in CLAUDE_CODE_PROVIDERS
+
+
+def supports_sampling(provider: str) -> bool:
+    """False when the provider ignores temperature/top_p."""
+    return not is_claude_code(provider)
+
+
+# Seconds without any output before a Claude Code call is killed.
+CLAUDE_CODE_IDLE_TIMEOUT = 90
+# Neutral cwd so the CLI never discovers a project CLAUDE.md or settings.
+_CLAUDE_CODE_CWD = tempfile.gettempdir()
+
+
+def claude_code_bare() -> bool:
+    return os.environ.get("CLAUDE_CODE_BARE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def claude_code_leak_terms() -> tuple[str, ...]:
+    """Account identifiers Claude Code will attach to every call (empty in
+    bare mode). The email's local part leaks on its own, without the domain,
+    so it is matched separately from the generic email regex."""
+    if claude_code_bare():
+        return ()
+    try:
+        out = subprocess.run(
+            [os.environ.get("CLAUDE_CODE_BIN", "claude"), "auth", "status", "--json"],
+            capture_output=True, text=True, timeout=20, cwd=_CLAUDE_CODE_CWD,
+        )
+        email = (json.loads(out.stdout).get("email") or "").strip()
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return ()
+    if not email:
+        return ()
+    local = email.split("@", 1)[0]
+    return (email, local) if len(local) >= 4 else (email,)
+
+
+def claude_code_command(name: str, system_prompt: str) -> list[str]:
+    cmd = [
+        os.environ.get("CLAUDE_CODE_BIN", "claude"),
+        "-p",
+        "--bare" if claude_code_bare() else "--safe-mode",
+        "--tools", "",
+        "--strict-mcp-config",
+        "--no-session-persistence",
+        # a non-default permission mode adds its own reminder to the context
+        "--permission-mode", "default",
+        "--effort", "low",
+        "--output-format", "stream-json",
+        "--include-partial-messages",
+        "--verbose",
+        "--model", name,
+    ]
+    if system_prompt:
+        cmd += ["--system-prompt", system_prompt]
+    return cmd
+
+
+def parse_claude_code_event(line: str) -> tuple[Optional[str], Optional[dict]]:
+    """Parse one stream-json line into (text_delta, result_event).
+
+    Raises RuntimeError on an error result so the caller's retry/backoff
+    path sees it like any other provider failure."""
+    line = line.strip()
+    if not line:
+        return None, None
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return None, None
+    kind = event.get("type")
+    if kind == "stream_event":
+        inner = event.get("event") or {}
+        delta = inner.get("delta") or {}
+        if inner.get("type") == "content_block_delta" and delta.get("type") == "text_delta":
+            return delta.get("text") or None, None
+        return None, None
+    if kind == "result":
+        if event.get("is_error") or event.get("subtype") not in (None, "success"):
+            detail = event.get("result") or event.get("errors") or event.get("subtype")
+            raise RuntimeError(f"claude code: {detail}")
+        return None, event
+    return None, None
+
+
+def _stream_claude_code(
+    name: str,
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int,
+    tracker: Optional[UsageTracker],
+) -> Iterator[str]:
+    proc = subprocess.Popen(
+        claude_code_command(name, system_prompt),
+        env={**os.environ, "MAX_THINKING_TOKENS": "0"},
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        cwd=_CLAUDE_CODE_CWD,
+    )
+    # stdin is written from a thread so a large prompt can't deadlock
+    # against a full stdout pipe.
+    def _feed():
+        try:
+            proc.stdin.write(user_prompt)
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+    threading.Thread(target=_feed, daemon=True).start()
+
+    watchdog: list[threading.Timer] = []
+
+    def _arm():
+        if watchdog:
+            watchdog[0].cancel()
+            watchdog.clear()
+        t = threading.Timer(CLAUDE_CODE_IDLE_TIMEOUT, proc.kill)
+        t.daemon = True
+        t.start()
+        watchdog.append(t)
+
+    # No max_tokens flag exists; approximate with the same 4-chars/token
+    # heuristic used elsewhere and cut the stream once it is spent.
+    char_budget = max(1, max_tokens) * 4
+    emitted: list[str] = []
+    emitted_chars = 0
+    result: Optional[dict] = None
+    cut = False
+    try:
+        _arm()
+        for line in proc.stdout:
+            _arm()
+            text, res = parse_claude_code_event(line)
+            if res is not None:
+                result = res
+            if not text:
+                continue
+            remaining = char_budget - emitted_chars
+            if len(text) >= remaining:
+                text = text[:remaining]
+                cut = True
+            emitted.append(text)
+            emitted_chars += len(text)
+            yield text
+            if cut:
+                break
+    finally:
+        if watchdog:
+            watchdog[0].cancel()
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        stderr = proc.stderr.read() if proc.stderr else ""
+        for f in (proc.stdout, proc.stderr):
+            if f:
+                f.close()
+
+    if not cut and result is None:
+        raise RuntimeError(
+            f"claude code exited {proc.returncode} without a result: {stderr.strip()[-300:]}"
+        )
+
+    if tracker is not None:
+        usage = (result or {}).get("usage") or {}
+        if usage:
+            prompt_tokens = (
+                int(usage.get("input_tokens") or 0)
+                + int(usage.get("cache_read_input_tokens") or 0)
+                + int(usage.get("cache_creation_input_tokens") or 0)
+            )
+            tracker.add(
+                prompt_tokens,
+                int(usage.get("output_tokens") or 0),
+                name,
+                cost=result.get("total_cost_usd"),
+            )
+        else:
+            # Cut early: the CLI never reached its result event.
+            tracker.add_approx(system_prompt + user_prompt, "".join(emitted), name)
+
+
 def stream_completion(
     provider: str,
     name: str,
@@ -150,7 +367,16 @@ def stream_completion(
     """Yields token strings as they stream in. If a UsageTracker is passed,
     accumulates usage from the stream's final chunk (preferred) or from a
     char/4 approximation (fallback when the provider omits usage)."""
+    if is_claude_code(provider):
+        if mode == "base":
+            raise ValueError("claude_code provider has no base (raw completion) mode")
+        yield from _stream_claude_code(name, system_prompt, user_prompt, max_tokens, tracker)
+        return
+
     model = _model_string(provider, name, mode)
+    sampling = {"temperature": temperature, "top_p": top_p}
+    if provider == "anthropic" or model.startswith("claude-"):
+        sampling = {"temperature": max(0.0, min(_ANTHROPIC_TEMP_MAX, temperature))}
 
     if mode == "base":
         # Base models have no chat template — concatenate any system framing
@@ -161,8 +387,7 @@ def stream_completion(
         response = litellm.text_completion(
             model=model,
             prompt=prompt,
-            temperature=temperature,
-            top_p=top_p,
+            **sampling,
             max_tokens=max_tokens,
             stream=True,
             stream_options={"include_usage": True},
@@ -175,8 +400,7 @@ def stream_completion(
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=temperature,
-            top_p=top_p,
+            **sampling,
             max_tokens=max_tokens,
             stream=True,
             stream_options={"include_usage": True},
